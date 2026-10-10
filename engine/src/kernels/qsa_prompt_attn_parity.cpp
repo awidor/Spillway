@@ -285,7 +285,23 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     cudaEventRecord(e1);
     ck(cudaEventSynchronize(e1), "time");
     cudaEventElapsedTime(&ms_new, e0, e1);
-    const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
+    // 4. dense (null ids, as prefill passes when nothing is selected) must equal ids 0..w-1 bit for bit
+    bool ok3 = true;
+    {
+        std::vector<int32_t> idn(ids.size());
+        for (int64_t i = 0; i < nq; ++i)
+            for (int64_t c = 0; c < cap; ++c) idn[i * cap + c] = (int32_t) c;
+        const int32_t* d_idn = up(idn);
+        std::vector<float> a(nw.size()), b(nw.size());
+        ck(k::qsa_prompt_attn_batch(d_q, pl, d_idn, d_steps, cap, s, d_new, nq, nullptr) ? cudaSuccess : cudaErrorUnknown, "ids");
+        ck(cudaMemcpy(a.data(), d_new, a.size() * 4, cudaMemcpyDeviceToHost), "down");
+        ck(k::qsa_prompt_attn_batch(d_q, pl, nullptr, d_steps, cap, s, d_new, nq, nullptr) ? cudaSuccess : cudaErrorUnknown, "dense");
+        ck(cudaMemcpy(b.data(), d_new, b.size() * 4, cudaMemcpyDeviceToHost), "down");
+        ok3 = std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+        if (!ok3) std::printf("FAIL dense (null ids) differs from ids 0..w-1\n");
+        cudaFree((void*) d_idn);
+    }
+    const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale) && ok3;
     const bool ok2 = diff <= 1e-4 * scale;
     uint64_t sum = 1469598103934665603ull;   // the new kernel's output bits: two builds of it compare by this
     for (float f : nw) {

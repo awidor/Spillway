@@ -159,7 +159,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
     float pa = 0.0f, pb = 0.0f;
     auto row_of = [&](int c0, int c) -> long long {          // as S.row below; -1 past the chunk's cells
         if (c >= min(CH, n - c0)) return -1;
-        const int cell = ids[c0 + c];
+        const int cell = ids != nullptr ? ids[c0 + c] : c0 + c;   // null: dense, cell = index
         const long long page = (long long) p.page_table[cell / page_size];
         return (page * n_kv_heads + kvh) * page_size + (cell % page_size);
     };

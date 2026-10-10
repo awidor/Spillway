@@ -61,3 +61,19 @@ Install + pack 10 s; tuning 9 engine starts (~15 s each); service up and answeri
 | spec 3, expert layout 6 / 7 | 133.7 / 155.4 |
 
 Through the service: 160.8 tok/s decode, drafts 227/270. `--undo` removed the service and /opt/strata.
+
+## Fix: long prompts crashed on Turing (laptop report, 10 Oct)
+
+On the box, a longer prompt failed with a GPU illegal memory access. It reproduces on the proxy with
+`STRATA_EMULATE_CC=75` and the S2 flags (`--max-context 32768 --kv int8 --mtp`, cache 5,610 slots).
+`CUDA_LAUNCH_BLOCKING=1` traced it to `qsa_prompt_attn_batch`: #1821's int8 prefetch read `ids[...]` with no null
+check, but prefill passes null ids for dense attention. sm_80+ takes the cp.async kernel, which has the check, so the
+crash only shows on Turing. Fix: dense cell = index, as in the other kernels. `qsa_prompt_attn_parity` now also
+checks null ids against ids 0..w-1 bit for bit; it crashed under EMULATE_CC=75 before the fix and passes after (int8
+and fp16, ctx 8K and 32K).
+
+| Prompt, proxy, MTP k=3 | Before | After: prompt tok/s | After: decode tok/s (64 tokens) |
+|---|---|---:|---:|
+| 6,019 tokens, EMULATE_CC=75 | illegal memory access | 2,498 | 112.2 |
+| 30,019 tokens, EMULATE_CC=75 | — | 1,779 | 29.8 |
+| 30,019 tokens, native sm_86 | — | 1,858 | 66.6 |

@@ -15,6 +15,7 @@ Not a fork: nothing here goes upstream. `README.md` and `docs/` are upstream's a
 | BF16 weights in native MMVQ, for byteshape's MTP layer (draft K/V, shared expert); the main model's dense path unchanged | `src/kernels/cuda/native_mmvq.cu`, `src/core/native_dense.cpp` |
 | Missing `<cstdint>` include | `include/strata/core/vram_floor.hpp` |
 | Merged: #1821 (Turing int8 K/V prompt attention), #1825 (Turing 4-lane prompt scorer) | `src/kernels/cuda/qsa_prompt_attn.cu`, `src/kernels/cuda/qsa_select.cu`, their parity tests, `CMakeLists.txt` |
+| Fix: #1821's int8 prefetch read `ids` without the dense (null ids) check, an illegal address on Turing for long prompts; the parity test now checks dense against ids 0..w-1 bit for bit | `src/kernels/cuda/qsa_prompt_attn.cu`, `src/kernels/qsa_prompt_attn_parity.cpp` |
 | Removed: SYCL engine, installer (`setup.py` and its tests), MCP server tool, Docker files, Windows launchers, translated READMEs | |
 | Line endings normalized to LF | all text files |
 
