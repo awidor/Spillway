@@ -122,3 +122,89 @@ runs `--max-context 131072 --kv int8 --kv-grow` and checks one ~117K-token reque
 
 Left at 128K: decode attention is compute-bound on CUDA cores at 4 tokens (145 GB/s of K/V); tensor cores are the
 next step. Prompt reading at 120K is 805 tok/s on the proxy, so about 2.5 minutes there and more on the box.
+
+## Dev server (11 Oct): a real Turing card
+
+From here the stand-in is a Proxmox host with a desktop **RTX 2070 SUPER** (TU104, sm_75, 40 SMs, 448 GB/s, 8 GB) and
+an i3-6100 (2 cores / 4 threads, far weaker than the box's 6-core i7). Builds and runs happen in a container there
+(`perfmodel/devbox.sh`), capped at 16 GB of RAM like the box. GPU kernels compare directly with the box's 2070 Max-Q
+(36 SMs, 384 GB/s); whole-engine decode speeds do not, because the i3 computes the CPU's share of the experts.
+
+## Prompt attention: several positions per block (dense, int8 K/V, 8 query heads per KV head)
+
+The Turing prompt-attention kernel (v1) ran one block per prompt position: its 16-row MMA tile held one position's 8
+query heads and 8 zero rows, and every position gathered and converted the whole K/V. New: a block takes 2 positions
+(Turing) or 4 (sm_80+), 16 real rows per tile, each K/V chunk gathered once for all of them. Per-row arithmetic is
+v1's (q and p as FP16 hi + lo halves, FP32-level): the same maximum error against the FP32 decode kernel (3e-6
+relative), and the same greedy tokens as v1 over 24 tokens of a 6K prompt (a repeat run of v1 itself splits at
+token 4: the engine is not bit-reproducible run to run). `perfmodel/prompt_bench.cu`, 2,048 positions at 30K:
+
+| RTX 2070 SUPER | Time | |
+|---|---:|---|
+| v1 | 213 ms | |
+| **2 positions per block (Turing default)** | **109 ms** | 1.96x |
+| 4 per block | 122 ms | 48 KB of shared memory: one block per Turing SM |
+| 2 / 4 per block, FP16 q and p (no lo half, `STRATA_PROMPT_MQ=2f` / `4f`) | 80 / 63 ms | 2.7x / 3.4x; FP16-level error (5.8e-4 relative), as llama.cpp's flash attention |
+
+With each position's V scale taken over the cells it attends (as v1 effectively does), the new kernel's output is
+**bit for bit v1's** (same output hash at 30K x 2,048, 6K x 513, 1.5K x 1.5K and 100 x 37 positions).
+
+Whole prompt, 30K tokens, `--max-context 131072 --kv int8 --kv-grow`: prompt attention 16.3 -> 8.3 s, prompt read
+26.4 -> 18.4 s (1,136 -> 1,628 tok/s). At 6K: 3.1 -> 2.7 s.
+
+## Decode attention on tensor cores (same kernel, split mode)
+
+The prompt kernel's tile (2 positions x 8 heads = 16 rows) fits a verify window, so the same kernel with the cells
+split across the GPU (block = split, KV head, 2 positions; partials into the flash-decoding merge) replaces the
+CUDA-core flash decoding on sm_75+ (`STRATA_ATTN_TC=0` turns it off). FP32-level (hi + lo), and a token's result is
+the same alone as in its window, bit for bit. `perfmodel/attn_bench.cu`, RTX 2070 SUPER, per layer:
+
+| Cells, window tokens | Batched (original) | CUDA-core flash decoding | Tensor cores |
+|---|---:|---:|---:|
+| 6K, 4 | 474 us | 136 us | **84 us** |
+| 30K, 3-4 | 1,921-2,059 us | 484 us | **299 us** |
+| 128K, 4 | 8,711 us | 2,048 us | **1,024 us** |
+
+End to end at 30K (dev server, MTP k=3): QSA attention 3.9 -> 2.0 ms per window, decode 48.9 -> 52.1 tok/s. The i3's
+CPU expert work is 19.5 of the 38 ms window here; on the box's 6-core i7 it is a fraction of that, so the GPU-side
+gain is a larger share there.
+
+## FP16 attention as the default (11 Oct)
+
+Both new kernels can take q and the probabilities as single FP16 halves instead of hi + lo pairs: half the MMAs,
+the precision of llama.cpp's CUDA flash attention, which is how byteshape's file normally runs. Next-token
+distribution right after the prompt (`STRATA_DUMP_FIRST_LOGITS`, `perfmodel/logit_compare.py`), against the hi + lo
+arithmetic:
+
+| Compared with hi + lo attention, int8 K/V | KL, 6K prompt | KL, 30K prompt | Top token / top 5 |
+|---|---:|---:|---|
+| the same run again | 0 | 0 | same / 5 of 5 |
+| **FP16 attention (now the default)** | **5.2e-4** | **1.0e-4** | same / 5 of 5 |
+| an FP16 K/V cache instead of int8 (for scale) | 2.1e-3 | 1.4e-3 | same / 5 of 5 |
+
+FP16 attention moves the output a quarter to a tenth as much as the int8 cache already does (upstream ships its
+CPU prompt share at a mean KL of about 0.004). Defaults now: prompts 4 positions per block, decode 2 per block for
+windows of 1-2 tokens and 4 above; `STRATA_PROMPT_MQ=2` / `STRATA_ATTN_TC=2` give back the hi + lo arithmetic.
+Window independence still holds (a token alone = in its window, 1-5 tokens).
+
+| RTX 2070 SUPER | v0.2.0 | hi + lo | **FP16 (default)** |
+|---|---:|---:|---:|
+| Prompt attention, 30K x 2,048 positions | 213 ms | 109 ms | **72 ms** |
+| Whole 30K prompt | 26.4 s | 18.4 s | **15.1 s** |
+| Decode attention per layer, 128K, 1 / 4 tokens | 849 / 2,048 us | 490 / 1,012 us | **414 / 651 us** |
+| Decode attention per layer, 6K, 4 tokens | 136 us | 84 us | **77 us** |
+
+## v0.3.0 against v0.2.0 (11 Oct), the packaged kit on the dev server
+
+Same binary; v0.2.0's kernels switched back on with `STRATA_PROMPT_MQ=0 STRATA_ATTN_TC=0`. RTX 2070 SUPER, i3-6100,
+`--max-context 131072 --kv int8 --kv-grow`, MTP k=3, 128 tokens.
+
+| | v0.2.0 kernels | v0.3.0 | |
+|---|---:|---:|---|
+| Prompt read, 6K tokens | 3.11 s | 2.65 s | 1.17x |
+| Prompt read, 30K tokens | 26.3 s | 15.1 s | 1.74x |
+| Decode, 6K prompt (three runs each) | 55.5-57.4 tok/s (one outlier 47.4) | 59.2-60.1 tok/s | +7% |
+| Decode, 30K prompt (one run each) | 50.0 tok/s | 54.2 tok/s | +8% |
+
+The i3's CPU expert work is about half of every decode window here; the box's 6-core i7 takes a fraction of that, so
+the attention savings are a larger share of its windows.

@@ -1,5 +1,6 @@
 // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
@@ -857,6 +858,17 @@ bool qsa_decode_attn_dense(const float* q, const QsaAttnPools& pools, const int3
     float* pa = scratch;
     float* pm = scratch + (size_t) n_chunks * s.n_head * HD;
     float* pl = pm + (size_t) n_chunks * s.n_head;
+    // sm_75+: the tensor-core partials (qsa_prompt_attn.cu); else (or STRATA_ATTN_TC=0) the CUDA-core kernel below
+    if (qsa_attn_dense_tc_partials(q, pools, steps, n_q, s, n_split, pa, pm, pl, stride, stream)) {
+        attn_merge_dense_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, (cudaStream_t) stream>>>(
+            pa, pm, pl, n_split, attn, stride);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "qsa_decode_attn_dense: %s\n", cudaGetErrorString(e));
+            std::exit(1);
+        }
+        return true;
+    }
     const float scale = 1.0f / sqrtf((float) HD);
     const int nqb = n_q == 1 ? 1 : n_q == 2 ? 2 : 4;
     const dim3 grid((unsigned) n_split, (unsigned) s.n_head_kv, (unsigned) ((n_q + nqb - 1) / nqb));

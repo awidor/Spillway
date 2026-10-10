@@ -29,4 +29,12 @@ namespace strata::kernels {
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream);
 
+/// Decode windows on tensor cores (sm_75+, int8 K/V, 8 query heads per KV head, dense: cells 0..width-1): block
+/// (split, KV head, positions) takes chunks split, split + n_split, ... and writes unnormalized sums, maxima and weight
+/// sums in qsa_decode_attn_dense's scratch layout (slot = kv head * n_split + split, `stride` floats per position).
+/// Returns false (nothing launched) when unsupported or with STRATA_ATTN_TC=0.
+bool qsa_attn_dense_tc_partials(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t n_q,
+                                const QsaShapes& s, int n_split, float* part_acc, float* part_m, float* part_l,
+                                long long stride, void* stream);
+
 }  // namespace strata::kernels

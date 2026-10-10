@@ -56,8 +56,10 @@ All dev-PC phases are done; what is left needs the box. Measured numbers: [RESUL
 - **Phase 7 (long context, 128K target):** decode attention as flash decoding for the dense selection (each window
   reads the K/V once; 3-4x faster per layer, 30K decode 106 -> 135 tok/s on the proxy); `--kv-grow`, so the 128K K/V
   (1.38 GB in int8) takes VRAM only as far as a request reaches and short requests keep the full expert cache;
-  S2 runs at 131072 and checks a ~117K-token request. Next: decode attention on tensor cores (at 128K it is
-  compute-bound on CUDA cores, about half of a window on the box) and prompt reading at 128K.
+  S2 runs at 131072 and checks a ~117K-token request.
+- **Phase 7, continued (11 Oct, dev server with a desktop RTX 2070 SUPER):** prompt attention with several positions
+  per block and decode windows on the same tensor-core kernel, FP16 q and p by default (llama.cpp's precision;
+  next-token KL 1e-4 to 5e-4). 30K prompt 26.4 -> 15.1 s; decode attention at 128K 2.0 -> 0.65 ms per layer.
 
 ## 1. Summary
 

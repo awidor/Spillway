@@ -1,6 +1,7 @@
 // Decode attention timing on the proxy: Qwen3.6's geometry (16 query heads, 2 KV heads, head_dim 256, int8 K/V,
 // dense selection), n_q queries of one verify window at a given context. Times the chunk and merge kernels apart.
-//   nvcc -O3 -std=c++17 -arch=sm_86 -I engine/include perfmodel/attn_bench.cu -o attn_bench && ./attn_bench 30000 3
+//   nvcc -O3 -std=c++17 -arch=sm_75 -I engine/include perfmodel/attn_bench.cu engine/src/kernels/cuda/qsa_prompt_attn.cu \
+//        -o attn_bench && ./attn_bench 30000 3   (STRATA_ATTN_TC=0: the CUDA-core flash decoding)
 #include "../engine/src/kernels/cuda/qsa_decode_attn.cu"
 #include <vector>
 #include <random>
