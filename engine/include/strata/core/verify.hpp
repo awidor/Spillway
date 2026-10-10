@@ -274,6 +274,9 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    /// The GPU prefetch's table, after init: per (layer, expert) the device alias of its mapped host blob (0: none).
+    /// Without it (or with STRATA_PREFETCH=0) nothing is prefetched.  False: no VRAM for it (the decode goes on without).
+    bool set_prefetch_alias(const std::vector<unsigned long long>& alias);
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
@@ -410,6 +413,25 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    // the PCIe share's copy kernel, forked beside the VRAM hits' math (STRATA_FETCH_FORK)
+    cudaStream_t fe_cs_ = nullptr;
+    cudaStream_t pg_cs_ = nullptr;                      ///< the next layer's expert prediction (beside fe_cs_'s copies)
+    cudaEvent_t ev_pg_ = nullptr;                       ///< the prediction (and prefetch plan) done
+    cudaEvent_t ev_pfd_ = nullptr;                      ///< the next layer's prefetch copy done
+    // the next layer's top-kp from this layer's hidden state (its residual after the mixer through the next layer's
+    // MoE norm and router), on pg_cs_: scored against the routing (STRATA_PREGATE_STATS=1) and prefetched (STRATA_PREFETCH)
+    int pg_kp_ = 0;
+    bool pg_stats_ = false;
+    int pf_max_ = 0;                                   ///< prefetched experts a layer at most (STRATA_PREFETCH_MAX)
+    unsigned long long* pf_alias_d_ = nullptr;          ///< (layer, expert) -> the mapped host blob's device alias, 0
+    uint8_t* pf_buf_ = nullptr;                         ///< 2 x pf_max_ blobs: the layers of each parity
+    unsigned long long* pf_src_d_ = nullptr;            ///< 2 x pf_max_: the prefetched blobs' aliases
+    int32_t* pf_n_d_ = nullptr;                         ///< 2: how many
+    int32_t *pf_host_h_ = nullptr, *pf_host_d_ = nullptr; ///< mapped: per layer the prefetched ids for the host's plan
+    float *pg_x_ = nullptr, *pg_logits_ = nullptr, *pg_w_ = nullptr;
+    int32_t* pg_ids_ = nullptr;
+    unsigned long long *pg_cnt_h_ = nullptr, *pg_cnt_d_ = nullptr;
+    cudaEvent_t ev_fe0_ = nullptr, ev_fe1_ = nullptr;
     // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches
     // on these side streams (record_window); the same kernels on the same inputs, only their order is freer
     bool df_branch_ = false;

@@ -283,6 +283,11 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    /// The GPU prefetch (mapped host memory, written by the GPU a layer ahead): per layer [count, expert ids...] of
+    /// `pf_stride` int32, count -1 when there is none.  A prefetched miss joins the PCIe share whatever pcie_frac says
+    /// (its blob is in VRAM already, the copy kernel skips it); the plan marks the layer read (-1).
+    volatile int32_t* pf_host = nullptr;
+    int pf_stride = 0;
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).

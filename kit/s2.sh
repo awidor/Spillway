@@ -90,9 +90,20 @@ for k in 2 3 4; do try "spec $k" "" --spec $k; done
 K=("${BEST_ARGS[@]}")
 for r in 450 250; do try "${K[*]}, vram reserve $r MiB" "" "${K[@]}" --vram-reserve-mib $r; done
 B=("${BEST_ARGS[@]}")
-for w in 5 4; do try "${B[*]}, $w pool workers" "" "${B[@]}" --pool-workers $w; done
+# the share of cache misses read over PCIe instead of computed on the CPU (default: the engine's link-based guess;
+# a desktop 2070 SUPER on PCIe 3.0 with a 2-core CPU decoded 79 tok/s at 1 against 59 at the guess)
+for f in 0.66 1; do try "${B[*]}, PCIe share $f" "" "${B[@]}" --pcie-frac $f; done
 B=("${BEST_ARGS[@]}")
-for e in 6 7; do try "${B[*]}, expert layout $e" "STRATA_EXP_MODE=$e" "${B[@]}"; done
+# the GPU prefetch of the next layer's predicted misses: on by default with up to 3 a layer (it shares the link with
+# the window's own copies and competes with the CPU's experts for RAM), and the copy kernel's blocks (default 4)
+try "${B[*]}, no GPU prefetch" "STRATA_PREFETCH=0" "${B[@]}"
+for p in 2 5; do try "${B[*]}, GPU prefetch up to $p a layer" "STRATA_PREFETCH_MAX=$p" "${B[@]}"; done
+B=("${BEST_ARGS[@]}"); E=$BEST_ENV
+try "${B[*]} $E, 8 copy blocks" "$E STRATA_FETCH_FORK=8" "${B[@]}"
+B=("${BEST_ARGS[@]}"); E=$BEST_ENV
+for w in 5 4; do try "${B[*]} $E, $w pool workers" "$E" "${B[@]}" --pool-workers $w; done
+B=("${BEST_ARGS[@]}"); E=$BEST_ENV
+for e in 6 7; do try "${B[*]} $E, expert layout $e" "$E STRATA_EXP_MODE=$e" "${B[@]}"; done
 say "best: ${BEST_ARGS[*]} ${BEST_ENV} -> $best tok/s"
 
 # ---- config and service
@@ -102,7 +113,7 @@ dest, model, host, env, *args = sys.argv[1:]
 cfg = {"exe": dest + "/bin/strata", "cwd": dest, "tokenizer": dest + "/pack/tokenizer", "model_name": "qwen3.6-35b-a3b",
        "host": host, "args": args}
 json.dump(cfg, open(dest + "/strata.json", "w"), indent=1)
-open(dest + "/engine.env", "w").write("LD_LIBRARY_PATH=%s/lib\n%s\n" % (dest, env.replace(" ", "\n")))
+open(dest + "/engine.env", "w").write("LD_LIBRARY_PATH=%s/lib\n%s\n" % (dest, "\n".join(env.split())))
 EOF
 sudo tee /etc/systemd/system/strata.service >/dev/null <<EOF
 [Unit]

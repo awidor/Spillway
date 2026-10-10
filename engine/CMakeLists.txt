@@ -838,6 +838,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(route_window_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(route_window_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME route_window_parity COMMAND route_window_parity)
+  if(NOT STRATA_HIP_GFX906 AND NOT STRATA_ENABLE_HIP)
+    # the fast router (router_top10's default) against the portable kernel, bitwise: the HIP test through a name shim
+    add_executable(cuda_router_fast tests/hip/router_fast.cpp)
+    target_include_directories(cuda_router_fast PRIVATE tests/cuda_shim ${_strata_gpu_include_directories})
+    target_link_libraries(cuda_router_fast PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME cuda_router_fast COMMAND cuda_router_fast)
+  endif()
 
   add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
   target_include_directories(router_top10_parity PRIVATE ${_strata_gpu_include_directories})

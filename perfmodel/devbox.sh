@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The dev server: a desktop RTX 2070 SUPER (Turing, sm_75, like the box's 2070 Max-Q) on a Proxmox host, reached over
 # ssh. Builds and runs happen in a long-lived container there (the kit/Dockerfile image, GPU attached); this PC only
-# edits and syncs.
+# edits and syncs. SYS_ADMIN in the container lets Nsight Compute (ncu) read the GPU's counters.
 #   bash perfmodel/devbox.sh setup            the container (once; needs the strata-build image on the server)
 #   bash perfmodel/devbox.sh sync             this tree -> /root/strata/src (no out/, no .git)
 #   bash perfmodel/devbox.sh build [targets]  sync, then kit/build_engine.sh in the container (default: strata)
@@ -22,6 +22,7 @@ case "${1:-}" in
             systemctl daemon-reload && systemctl start strata.slice &&
             docker rm -f strata-dev >/dev/null 2>&1; mkdir -p /root/strata/{src,work,models,packs,out} &&
             docker run -d --name strata-dev --restart unless-stopped --cgroup-parent=strata.slice --gpus all --ipc=host --ulimit memlock=-1:-1 \
+              --cap-add SYS_ADMIN \
               -v /root/strata/src:/src -v /root/strata/work:/work -v /root/strata/out:/src/out -v /root/strata:/strata \
               strata-build sleep infinity >/dev/null && docker exec strata-dev nvidia-smi -L' ;;
     sync) sync ;;

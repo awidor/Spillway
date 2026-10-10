@@ -603,10 +603,11 @@ __global__ void force_token_kernel(int32_t* tok, const int32_t* force, int j) {
 
 }  // namespace
 
-void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
+void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream,
+                 int blocks) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
-    fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
+    fetch_blobs_kernel<<<blocks > 0 ? blocks : 48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
 }
 
@@ -1201,6 +1202,122 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     copy_or_zero_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src, n4, skip,
                                                                     value);
     check("copy_or_zero_from_mapped");
+}
+
+namespace {
+__global__ void pregate_stats_kernel(const int32_t* ids, const int32_t* pred, int n, int k, int kp, const int32_t* res,
+                                     int n_expert, unsigned long long* cnt) {
+    __shared__ unsigned char act[1024], prd[1024];
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) { act[e] = 0; prd[e] = 0; }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n * k; i += blockDim.x) act[ids[i]] = 1;
+    for (int i = threadIdx.x; i < n * kp; i += blockDim.x) prd[pred[i]] = 1;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    unsigned long long a = 0, ap = 0, m = 0, mp = 0, pm = 0;
+    for (int e = 0; e < n_expert; ++e) {
+        const bool miss = res == nullptr || res[e] < 0;
+        if (act[e]) { ++a; ap += prd[e]; if (miss) { ++m; mp += prd[e]; } }
+        if (prd[e] && miss) ++pm;
+    }
+    cnt[0] += 1; cnt[1] += a; cnt[2] += ap; cnt[3] += m; cnt[4] += mp; cnt[5] += pm;
+}
+__global__ void prefetch_plan_kernel(const int32_t* pred, int n, int kp, const int32_t* res,
+                                     const unsigned long long* alias, int maxp, unsigned long long* src, int32_t* n_out,
+                                     volatile int32_t* host) {
+    __shared__ unsigned char seen[1024];
+    for (int e = threadIdx.x; e < 1024; e += blockDim.x) seen[e] = 0;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    int c = 0;
+    for (int r = 0; r < kp && c < maxp; ++r)
+        for (int t = 0; t < n && c < maxp; ++t) {
+            const int e = pred[t * kp + r];
+            if (e < 0 || e >= 1024 || seen[e]) continue;
+            seen[e] = 1;
+            if ((res == nullptr || res[e] < 0) && alias[e] != 0) {
+                if (host) host[1 + c] = e;
+                src[c++] = alias[e];
+            }
+        }
+    *n_out = c;
+    if (host) {   // the ids first, then the count the host reads them by
+        __threadfence_system();
+        host[0] = c;
+        __threadfence_system();
+    }
+}
+__device__ __forceinline__ int pf_slot(unsigned long long p, const unsigned long long* pf_src, int pf_n) {
+    for (int j = 0; j < pf_n; ++j)
+        if (pf_src[j] == p) return j;
+    return -1;
+}
+__global__ void fetch_blobs_pf_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                      uint4* __restrict__ dst, long long per, const unsigned long long* __restrict__ pf_src,
+                                      const int32_t* __restrict__ pf_n) {
+    const int nb = *n, np = *pf_n;
+    for (int k = 0; k < nb; ++k) {   // blob by blob: the prefetched ones are skipped whole
+        if (pf_slot(src[k], pf_src, np) >= 0) continue;
+        const uint4* s = (const uint4*) src[k];
+        uint4* d = dst + k * per;
+        for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < per; i += (long long) gridDim.x * blockDim.x)
+            d[i] = s[i];
+    }
+}
+__global__ void rebase_ptrs_pf_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes,
+                                      const unsigned long long* pf_src, const int32_t* pf_n, unsigned long long pf_base) {
+    const int k = threadIdx.x;
+    if (k >= *n) return;
+    const int j = pf_slot(ptr[k], pf_src, *pf_n);
+    ptr[k] = j >= 0 ? pf_base + (unsigned long long) j * (unsigned long long) bytes
+                    : base + (unsigned long long) k * (unsigned long long) bytes;
+}
+__global__ void pf_merge_kernel(unsigned long long* ptr, int32_t* start, int32_t* counts, unsigned long long* ptr2,
+                                int32_t* start2, const unsigned long long* pf_src, const int32_t* pf_n,
+                                unsigned long long pf_base, long long bytes) {
+    const int c0 = counts[0], c2 = counts[2], np = *pf_n;
+    int m = 0;
+    for (; m < c2; ++m) {
+        const int j = pf_slot(ptr2[m], pf_src, np);
+        if (j < 0) break;
+        ptr[c0 + m] = pf_base + (unsigned long long) j * (unsigned long long) bytes;
+        start[c0 + m + 1] = start2[m + 1];
+    }
+    if (m == 0) return;
+    for (int q = 0; q + m < c2; ++q) ptr2[q] = ptr2[q + m];
+    for (int q = 0; q + m <= c2; ++q) start2[q] = start2[q + m];
+    counts[0] = c0 + m;
+    counts[2] = c2 - m;
+}
+}  // namespace
+void pf_merge(unsigned long long* ptr, int32_t* start, int32_t* counts, unsigned long long* ptr2, int32_t* start2,
+              const unsigned long long* pf_src, const int32_t* pf_n, uint8_t* pf_base, int64_t blob_bytes, void* stream) {
+    pf_merge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ptr, start, counts, ptr2, start2, pf_src, pf_n,
+                                                        (unsigned long long) pf_base, (long long) blob_bytes);
+    check("pf_merge");
+}
+void prefetch_plan(const int32_t* pred, int n, int kp, const int32_t* res, const unsigned long long* alias, int maxp,
+                   unsigned long long* src, int32_t* n_out, int32_t* host, void* stream) {
+    prefetch_plan_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(pred, n, kp, res, alias, maxp, src, n_out, host);
+    check("prefetch_plan");
+}
+void fetch_blobs_pf(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int blocks,
+                    const unsigned long long* pf_src, const int32_t* pf_n, void* stream) {
+    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs_pf: blob size must be a multiple of 16\n"); std::exit(1); }
+    fetch_blobs_pf_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16),
+                                                                      pf_src, pf_n);
+    check("fetch_blobs_pf");
+}
+void rebase_ptrs_pf(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes,
+                    const unsigned long long* pf_src, const int32_t* pf_n, uint8_t* pf_base, void* stream) {
+    rebase_ptrs_pf_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ptr, n, (unsigned long long) base, (long long) blob_bytes,
+                                                                pf_src, pf_n, (unsigned long long) pf_base);
+    check("rebase_ptrs_pf");
+}
+void pregate_stats(const int32_t* ids, const int32_t* pred, int n, int k, int kp, const int32_t* res, int n_expert,
+                   unsigned long long* cnt, void* stream) {
+    pregate_stats_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(ids, pred, n, k, kp, res, n_expert, cnt);
+    check("pregate_stats");
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {

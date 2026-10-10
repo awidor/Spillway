@@ -2053,12 +2053,73 @@ void launch_mmvq_multi_nc(dim3 grid, dim3 block, cudaStream_t s, const uint8_t* 
     }
 }
 
+// mmvq_multi_kernel<TY, NC, false, true> with the activations staged in shared memory once per block: a warp's lanes
+// read 32 different q8_1 blocks per load, which from L1/L2 was a transaction per lane for every row and column (the
+// call's time grew ~15 us per column on a 2070 SUPER at 2048 x 8192), and from LDS is one conflict-free wavefront (the
+// 36-byte blocks are 9 words apart, odd).  Each row is still one warp's row_dot_multi: the same lanes, the same sums
+// in the same order, so the outputs are bitwise the same.  A block takes 8 warps x RW rows.
+template<int TY, int NC, int RW>
+__global__ void __launch_bounds__(256) mmvq_multi_lds_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                             const block_q8_1* __restrict__ x, float* __restrict__ y,
+                                                             int n_in, int n_out) {
+    extern __shared__ int s_xi[];
+    const int xb = n_in / 32, tid = threadIdx.y * 32 + threadIdx.x;
+    const int* src = (const int*) x;
+    for (int i = tid; i < NC * xb * 9; i += 256) s_xi[i] = src[i];   // NC columns of xb 36-byte blocks
+    __syncthreads();
+    const block_q8_1* sx = (const block_q8_1*) s_xi;
+    const int nb = n_in / Fmt<TY>::qk, lane = threadIdx.x;
+    int off[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) off[c] = c * xb;
+#pragma unroll
+    for (int r = 0; r < RW; ++r) {
+        const int row = (blockIdx.x * RW + r) * 8 + threadIdx.y;
+        if (row >= n_out) return;
+        float sv[NC];
+        row_dot_multi<TY, NC, true, false>(w + (size_t) row * row_bytes, sx, off, NC, nb, lane, sv, nullptr);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (lane == c) y[(size_t) c * n_out + row] = sv[c];
+    }
+}
+// STRATA_IQ_MMVQ_LDS: rows a warp in the LDS kernel (0: the kernel above it)
+int g_mmvq_lds_rw = [] { const char* v = std::getenv("STRATA_IQ_MMVQ_LDS"); return v ? std::atoi(v) : 2; }();
+
+template<int TY, int RW>
+bool launch_mmvq_lds_rw(cudaStream_t s, const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out,
+                        int ncols) {
+    const size_t smem = (size_t) ncols * (n_in / 32) * 36;
+    if (smem > 48 * 1024) return false;
+    const dim3 grid((unsigned) ((n_out + 8 * RW - 1) / (8 * RW))), block(32, 8);
+    switch (ncols) {
+        case 1: mmvq_multi_lds_kernel<TY, 1, RW><<<grid, block, smem, s>>>(W, rb, X, y, n_in, n_out); return true;
+        case 2: mmvq_multi_lds_kernel<TY, 2, RW><<<grid, block, smem, s>>>(W, rb, X, y, n_in, n_out); return true;
+        case 3: mmvq_multi_lds_kernel<TY, 3, RW><<<grid, block, smem, s>>>(W, rb, X, y, n_in, n_out); return true;
+        case 4: mmvq_multi_lds_kernel<TY, 4, RW><<<grid, block, smem, s>>>(W, rb, X, y, n_in, n_out); return true;
+        case 5: mmvq_multi_lds_kernel<TY, 5, RW><<<grid, block, smem, s>>>(W, rb, X, y, n_in, n_out); return true;
+        case 6: mmvq_multi_lds_kernel<TY, 6, RW><<<grid, block, smem, s>>>(W, rb, X, y, n_in, n_out); return true;
+        default: return false;
+    }
+}
+template<int TY>
+bool launch_mmvq_lds(cudaStream_t s, const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out,
+                     int ncols) {
+    switch (g_mmvq_lds_rw) {
+        case 1: return launch_mmvq_lds_rw<TY, 1>(s, W, rb, X, y, n_in, n_out, ncols);
+        case 2: return launch_mmvq_lds_rw<TY, 2>(s, W, rb, X, y, n_in, n_out, ncols);
+        case 4: return launch_mmvq_lds_rw<TY, 4>(s, W, rb, X, y, n_in, n_out, ncols);
+        default: return false;
+    }
+}
+
 template<int TY>
 void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
                  cudaStream_t s) {
     const dim3 grid((unsigned) ((n_out + 3) / 4)), block(32, 4);
     if constexpr (!kSplit<TY>) mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
     else if (g_old_kernels) mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+    else if ((!kStageIqGrid<TY> || !g_stage_grid_mmvq) && launch_mmvq_lds<TY>(s, W, rb, X, y, n_in, n_out, ncols)) return;
     else if constexpr (kStageIqGrid<TY>) {
         if (!g_stage_grid_mmvq) {
             launch_mmvq_multi_nc<TY, false>(grid, block, s, W, rb, X, y, n_in, n_out, ncols);

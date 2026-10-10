@@ -44,6 +44,27 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// STRATA_PREGATE_STATS: a window's routed experts `ids` [n,k] against a prediction `pred` [n,kp] made a layer
+/// early; res [n_expert] the layer's residency (negative: not in VRAM).  Adds to cnt[0..5]: windows, routed experts,
+/// of them predicted, routed misses, of them predicted, predicted misses (what a prefetch would copy).
+/// The GPU prefetch (STRATA_PREFETCH): from a layer's predicted experts `pred` [n,kp], the ones not in VRAM (res < 0)
+/// with a mapped host blob (alias != 0), rank by rank, up to `maxp`: their aliases into src[], their count into *n_out.
+/// `host` (mapped, or nullptr): [count, expert ids...] for the host's plan of that layer.
+void prefetch_plan(const int32_t* pred, int n, int kp, const int32_t* res, const unsigned long long* alias, int maxp,
+                   unsigned long long* src, int32_t* n_out, int32_t* host, void* stream);
+/// fetch_blobs / rebase_ptrs for a layer some of whose PCIe share was prefetched: a blob whose source is pf_src[j]
+/// (j < *pf_n) is not copied, and its pointer becomes pf_base + j * blob_bytes.
+void fetch_blobs_pf(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int blocks,
+                    const unsigned long long* pf_src, const int32_t* pf_n, void* stream);
+void rebase_ptrs_pf(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes,
+                    const unsigned long long* pf_src, const int32_t* pf_n, uint8_t* pf_base, void* stream);
+/// The leading PCIe groups whose blobs the prefetch holds (ptr2[q] == pf_src[j]) join the VRAM groups (pointing at
+/// pf_base + j * blob_bytes), so the hits' launch computes them; the rest of the PCIe list moves up.  The plan's
+/// entries stay where they are: the VRAM groups' run on into the moved groups' (start[counts[0]] == start2[0]).
+void pf_merge(unsigned long long* ptr, int32_t* start, int32_t* counts, unsigned long long* ptr2, int32_t* start2,
+              const unsigned long long* pf_src, const int32_t* pf_n, uint8_t* pf_base, int64_t blob_bytes, void* stream);
+void pregate_stats(const int32_t* ids, const int32_t* pred, int n, int k, int kp, const int32_t* res, int n_expert,
+                   unsigned long long* cnt, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
@@ -82,7 +103,9 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 /// Plan v0.3 P6: copy *n (device memory) blobs of `blob_bytes` from mapped host memory (src[k], device aliases)
 /// into dst + k * blob_bytes with coalesced 16-byte loads - the PCIe share of a layer's missed experts, staged
 /// into VRAM before the grouped expert kernel reads them.  Launched for a capacity of `cap` blobs.
-void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream);
+/// `blocks`: the grid (0: 384, the whole GPU; a forked copy beside other work takes a few).
+void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream,
+                 int blocks = 0);
 /// ptr[k] = base + k * blob_bytes for k < *n (the staged copies `fetch_blobs` made).
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream);
 

@@ -51,7 +51,8 @@ int main(int argc, char** argv) {
     CK(cudaMemcpy(dst, steps.data(), steps.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dq, qv.data(), qv.size() * 4, cudaMemcpyHostToDevice));
     QsaAttnPools p; p.k_q = dk; p.v_q = dv; p.k_scale = dks; p.v_scale = dvs; p.page_table = dpt;
-    // FP32 reference: the decode kernel, 64 positions at a time
+    // FP32 reference: the CUDA-core decode kernel (not its tensor-core path), 64 positions at a time
+    setenv("STRATA_ATTN_TC", "0", 1);
     for (int t0 = 0; t0 < T; t0 += 64) {
         const int nb = std::min(64, T - t0);
         if (!qsa_decode_attn_dense(dq + (size_t) t0 * 16 * 256, p, dst + (size_t) t0 * kStepCount, cap, s, dscr,

@@ -60,6 +60,10 @@ All dev-PC phases are done; what is left needs the box. Measured numbers: [RESUL
 - **Phase 7, continued (11 Oct, dev server with a desktop RTX 2070 SUPER):** prompt attention with several positions
   per block and decode windows on the same tensor-core kernel, FP16 q and p by default (llama.cpp's precision;
   next-token KL 1e-4 to 5e-4). 30K prompt 26.4 -> 15.1 s; decode attention at 128K 2.0 -> 0.65 ms per layer.
+- **Decode, missed experts (v0.4.0, 11 Oct):** the PCIe copy beside the VRAM hits, a GPU prefetch of the next
+  layer's predicted misses (the host plan hands them to the GPU), one-launch routing, the fast top-k, i-quant MMVQ
+  from shared memory. Dev server, box flags: decode +31-42% against v0.3.0 at 6K and 30K. S2 tunes the PCIe share
+  and the prefetch on the box.
 
 ## 1. Summary
 

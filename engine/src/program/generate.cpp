@@ -7265,6 +7265,14 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        if (srcp != nullptr && n_stages == 1) {   // the GPU prefetch's table: each expert's mapped host blob, as the plan's PCIe share has it
+            std::vector<unsigned long long> alias((size_t) (g.n_layers * g.n_expert), 0);
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (srcp->pinned(l, e)) alias[(size_t) (l * g.n_expert + e)] = (unsigned long long) srcp->device_alias(l, e);
+            if (!ver.set_prefetch_alias(alias))
+                std::fprintf(stderr, "strata serve: no VRAM for the GPU prefetch's buffers; decoding without it\n");
+        }
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it

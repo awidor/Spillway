@@ -3177,12 +3177,36 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
-        const bool pcie_ok = (d.require_gpu_experts || d.pcie_num > 0) && d.src->pcie_layer(d.layers);
-        const int m = pcie_ok ? (d.require_gpu_experts ? nmiss : (nmiss * d.pcie_num) >> 8) : 0;
-        int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
+        // the GPU prefetch's experts for this layer (read once, then marked read)
+        int32_t pf_ids[64];
+        int npf = 0;
+        if (P.pf_host != nullptr && P.pcie_mode != 0) {
+            volatile int32_t* row = P.pf_host + (size_t) d.layers * (size_t) P.pf_stride;
+            npf = std::clamp((int) row[0], 0, std::min(P.pf_stride - 1, 64));
+            for (int j = 0; j < npf; ++j) pf_ids[j] = row[1 + j];
+            row[0] = -1;
+        }
+        auto prefetched = [&](int32_t e) {
+            for (int j = 0; j < npf; ++j)
+                if (pf_ids[j] == e) return true;
+            return false;
+        };
+        int nmiss_pf = 0;
+        if (npf > 0)
+            for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                    prefetched(e))
+                    ++nmiss_pf;
+            }
+        const bool pcie_ok = (d.require_gpu_experts || d.pcie_num > 0 || nmiss_pf > 0) && d.src->pcie_layer(d.layers);
+        // pcie_frac applies to the misses the prefetch did not bring
+        const int m = pcie_ok ? (d.require_gpu_experts ? nmiss : ((nmiss - nmiss_pf) * d.pcie_num) >> 8) : 0;
+        int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         const uint8_t* dma_src[kMaxWindowEntries];
-        int64_t pcie_i0[kMaxWindowEntries];
+        int64_t pcie_i0[kMaxWindowEntries], pcie_tmp[kMaxWindowEntries];
+        const uint8_t* src_tmp[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
@@ -3202,7 +3226,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < kMaxWindowEntries) {
+                    const bool pf = npf > 0 && prefetched(e);
+                    if ((pf || miss_rank >= nmiss - nmiss_pf - m) && fetches < P.staging_cap && fetches < kMaxWindowEntries) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;
@@ -3211,7 +3236,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                             ++fetches;
                         }
                     }
-                    ++miss_rank;
+                    if (!pf) ++miss_rank;
                 }
             }
             if (d.require_gpu_experts && kd != 0 && kd != 1) {
@@ -3236,6 +3261,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         P.start[groups] = entries;
         const uint64_t bb = lay.blob_bytes(d.layers);
+        if (npf > 0) {   // the prefetched ones first: the GPU moves that leading run into its hits' launch (pf_merge)
+            int w = 0;
+            for (int pass = 0; pass < 2; ++pass)
+                for (int q = 0; q < fetches; ++q) {
+                    if (prefetched(ids[pcie_i0[q]]) != (pass == 0)) continue;
+                    pcie_tmp[w] = pcie_i0[q];
+                    src_tmp[w++] = dma_src[q];
+                }
+            for (int q = 0; q < fetches; ++q) { pcie_i0[q] = pcie_tmp[q]; dma_src[q] = src_tmp[q]; }
+        }
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
             P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])

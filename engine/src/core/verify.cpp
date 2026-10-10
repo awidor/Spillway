@@ -38,6 +38,7 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
+#include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/progress.hpp"
@@ -148,6 +149,18 @@ const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: pe
 // gfx1030 (RX 6800, Windows, 42.5 -> 56.4 t/s).  STRATA_SH_STREAM overrides either default: `=1` forks, `=0` does not.
 // Strix Halo (gfx1151, unified memory) is the exception: the fork pays there (+1.8% UD-IQ4_XS, +6.7% UD-Q4_K_XL decode
 // at 8K, ids identical), so the gfx1151 arch table sets STRATA_SH_STREAM=1.  Read on first use, after that table ran.
+// The PCIe share's copy kernel (--pcie-mode kernel, the default) runs on its own stream beside the VRAM hits' grouped
+// kernel, which it used to wait behind: the copy is bound by the link, the hits by the SMs.  A few blocks keep the
+// link busy and leave the SMs to the hits.  STRATA_FETCH_FORK=0: the copy after the hits as before; =N: N blocks.
+int fetch_fork_blocks() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_FETCH_FORK");
+        return v ? std::atoi(v) : 4;
+    }();
+    return n;
+}
+bool fetch_fork_on() { return fetch_fork_blocks() > 0; }
+
 bool sh_stream_on() {
     static const bool on = [] {
         if (const char* v = std::getenv("STRATA_SH_STREAM")) return v[0] != '0';
@@ -383,6 +396,16 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (fe_cs_) cudaStreamSynchronize(fe_cs_);
+    if (pg_cs_) cudaStreamSynchronize(pg_cs_);
+    if (pg_cnt_h_) {
+        const unsigned long long* c = pg_cnt_h_;
+        std::fprintf(stderr, "strata pregate (top-%d a layer early): %llu layer-windows, routed %llu (%.1f%% predicted), "
+                     "misses %llu (%.1f%% predicted), predicted misses %llu (%.2f a layer-window, %.2f routed)\n", pg_kp_, c[0], c[1],
+                     100.0 * c[2] / std::max(c[1], 1ull), c[3], 100.0 * c[4] / std::max(c[3], 1ull), c[5],
+                     (double) c[5] / std::max(c[0], 1ull), (double) c[3] / std::max(c[0], 1ull));
+        cudaFreeHost(pg_cnt_h_);
+    }
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     for (auto& e : exec_nr_)
@@ -398,6 +421,16 @@ Verifier::~Verifier() {
     if (d_spec_) cudaFree(d_spec_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (fe_cs_) cudaStreamDestroy(fe_cs_);
+    if (pg_cs_) cudaStreamDestroy(pg_cs_);
+    if (ev_pg_) cudaEventDestroy(ev_pg_);
+    if (ev_pfd_) cudaEventDestroy(ev_pfd_);
+    for (void* p : {(void*) pg_x_, (void*) pg_logits_, (void*) pg_w_, (void*) pg_ids_, (void*) pf_alias_d_, (void*) pf_buf_,
+                    (void*) pf_src_d_, (void*) pf_n_d_})
+        if (p) cudaFree(p);
+    if (pf_host_h_) cudaFreeHost(pf_host_h_);
+    if (ev_fe0_) cudaEventDestroy(ev_fe0_);
+    if (ev_fe1_) cudaEventDestroy(ev_fe1_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (ev_done_) cudaEventDestroy(ev_done_);
@@ -644,6 +677,45 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: event create failed";
         return false;
     }
+    // the side streams at the highest priority: their few blocks take SMs as the hits' blocks retire instead of
+    // waiting behind whole grids (the graphs keep the priority: cudaGraphInstantiateFlagUseNodePriority)
+    int prio_lo = 0, prio_hi = 0;
+    cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+    if (fetch_fork_on() && (cudaStreamCreateWithPriority(&fe_cs_, cudaStreamNonBlocking, prio_hi) != cudaSuccess ||
+                            cudaStreamCreateWithPriority(&pg_cs_, cudaStreamNonBlocking, prio_hi) != cudaSuccess ||
+                            cudaEventCreateWithFlags(&ev_fe0_, cudaEventDisableTiming) != cudaSuccess ||
+                            cudaEventCreateWithFlags(&ev_fe1_, cudaEventDisableTiming) != cudaSuccess ||
+                            cudaEventCreateWithFlags(&ev_pg_, cudaEventDisableTiming) != cudaSuccess ||
+                            cudaEventCreateWithFlags(&ev_pfd_, cudaEventDisableTiming) != cudaSuccess)) {
+        err = "verify: fetch stream create failed";
+        return false;
+    }
+    if (fe_cs_ != nullptr && pg_x_ == nullptr && !g.has_hc() && g.n_expert <= 1024) {
+        // the GPU prefetch: the next layer's top-kp (default 8, the model's own k; STRATA_PREFETCH=0: off), up to
+        // STRATA_PREFETCH_MAX (default 3) of its misses a layer copied ahead; STRATA_PREGATE_STATS=kp scores it alone
+        const char* pe = std::getenv("STRATA_PREFETCH");
+        const char* se = std::getenv("STRATA_PREGATE_STATS");
+        const int pf = pe ? std::atoi(pe) : 8, st = se ? std::atoi(se) : 0;
+        pg_kp_ = std::min(pf > 0 ? pf : st, 64);
+        pg_stats_ = st > 0;
+        if (pf > 0) {
+            const char* me = std::getenv("STRATA_PREFETCH_MAX");
+            pf_max_ = std::clamp(me ? std::atoi(me) : 3, 1, 64);
+        }
+        if (pg_kp_ > 0 && (cudaMalloc(&pg_x_, (size_t) T * N * 4) != cudaSuccess ||
+                           cudaMalloc(&pg_logits_, (size_t) T * g.n_expert * 4) != cudaSuccess ||
+                           cudaMalloc(&pg_w_, (size_t) T * pg_kp_ * 4) != cudaSuccess ||
+                           cudaMalloc(&pg_ids_, (size_t) T * pg_kp_ * 4) != cudaSuccess)) {
+            err = "verify: the expert prediction's buffers";
+            return false;
+        }
+        if (pg_stats_ && (cudaHostAlloc(&pg_cnt_h_, 64, cudaHostAllocMapped) != cudaSuccess ||
+                          cudaHostGetDevicePointer((void**) &pg_cnt_d_, pg_cnt_h_, 0) != cudaSuccess)) {
+            err = "verify: pregate stats buffers";
+            return false;
+        }
+        if (pg_cnt_h_) std::memset(pg_cnt_h_, 0, 64);
+    }
     {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
         // stage's window with the branches stopped inside its graph when an NVML query (nvidia-smi) came between
         // requests (2x RTX 3090 and 2x RTX 2080 Ti, #905); never seen on Windows.  0 / unset: one stream, as before
@@ -741,6 +813,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
+    // the next layer's expert prediction runs (on pg_cs_, joined back to cs in every post()) and, with its
+    // table, prefetches: one group, the copy kernel forked, a residency table, not all experts resident
+    const bool pg_on = pg_x_ != nullptr && G == 1 && fe_cs_ != nullptr && !prof_on_ && sink_.pcie_mode == 2 &&
+                       hits_.d_res != nullptr && !ar_on() && (pg_stats_ || pf_alias_d_ != nullptr);
+    const bool pf_on = pg_on && pf_alias_d_ != nullptr;
     const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) {
@@ -1370,9 +1447,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                           NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
-#if defined(STRATA_HIP_GFX906)
+#if !defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
         } else if (dec_batch) {
-            // gfx906: the Coder's 256-expert router (the native router is 512 x 10 only) for the whole window in one
+            // gfx906 and CUDA: a 256-expert router (the native router is 512 x 10 only) for the whole window in one
             // multi-column BF16 projection and one top-k, bitwise the per-token calls (route_window_parity); ~3 ms
             // of a ~55 ms verify window on 2x MI50.  STRATA_ROUTE_PER_TOKEN=1: the per-token calls.
             if (!moe_route_window(wt, g, l, K, ss.moe, mixed_ + tb * N, logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n,
@@ -1394,6 +1471,34 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       route_resident_cfg().lo, route_resident_cfg().hi,
                                       route_resident_cfg().stats() + (n <= 8 ? 4 : 0), cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
+        }
+        if (pg_on) {
+            // the next layer's experts, predicted on their own stream from this layer's residual (read before the next
+            // layer adds to it: post() joins pg_cs_ first); scored, and the predicted misses planned for the prefetch.
+            // Not on fe_cs_: this layer's PCIe share would wait behind it.
+            if (pf_on && l == lb_) cudaMemsetAsync(pf_n_d_, 0, 2 * 4, cs);   // (before post's fork reads them)
+            cudaEventRecord(ev_fe0_, cs);
+            cudaStreamWaitEvent(pg_cs_, ev_fe0_, 0);
+            if (pg_stats_ && l > lb_)
+                pregate_stats(ids_ + tb * K, pg_ids_ + tb * pg_kp_, n, (int) K, pg_kp_, hits_.d_res + l * g.n_expert, (int) NE,
+                              pg_cnt_d_, pg_cs_);
+            const WeightRef *wn1 = nullptr, *wr1 = nullptr;
+            if (l + 1 < le_) {
+                const LayerView v1(wt, l + 1);
+                wn1 = v1.get("post_attention_norm.weight");
+                wr1 = v1.get("ffn_gate_inp.weight");
+            }
+            if (wn1 && wr1) {
+                native_gr_rms_norm_weighted_multi(Rt(tb), (const float*) wn1->data, pg_x_ + tb * N, (int) N, 1, n, EPS, pg_cs_);
+                bf16_gemv_fp32_mmvf_cols(pg_x_ + tb * N, (const uint16_t*) wr1->data, pg_logits_ + tb * NE, N, NE, n, pg_cs_);
+                router_top10(pg_logits_ + tb * NE, n, (int) NE, pg_kp_, pg_ids_ + tb * pg_kp_, pg_w_ + tb * pg_kp_, pg_cs_);
+                if (pf_on)
+                    prefetch_plan(pg_ids_ + tb * pg_kp_, n, pg_kp_, hits_.d_res + (l + 1) * g.n_expert,
+                                  pf_alias_d_ + (l + 1) * g.n_expert, pf_max_, pf_src_d_ + ((l + 1) & 1) * pf_max_,
+                                  pf_n_d_ + ((l + 1) & 1),
+                                  pf_host_d_ ? pf_host_d_ + (l + 1) * (pf_max_ + 1) : nullptr, pg_cs_);
+            }
+            cudaEventRecord(ev_pg_, pg_cs_);
         }
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
@@ -1519,17 +1624,53 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             }
+            // the PCIe share is in staging (DMA) or mapped; with the copy kernel, stage it, then point at staging
+            auto fetch = [&](cudaStream_t s, int blocks) {
+                if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, s);
+                else wait_flag_ge(m_flagB_, ring, s);
+                if (sink_.pcie_mode == 2) {
+                    const int64_t per = G == 2 ? staging_blobs_ / 2 : staging_blobs_;
+                    uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                    if (pf_on && s == fe_cs_) {   // this layer's prefetched blobs are in pf_buf_ (parity l & 1) already
+                        const int par = (int) (l & 1);
+                        fetch_blobs_pf(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), blocks,
+                                       pf_src_d_ + par * pf_max_, pf_n_d_ + par, s);
+                        rebase_ptrs_pf((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l),
+                                       pf_src_d_ + par * pf_max_, pf_n_d_ + par, pf_buf_ + (size_t) par * pf_max_ * lay.max_blob, s);
+                    } else {
+                        fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, s, blocks);
+                        rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), s);
+                    }
+                }
+            };
+            if (pf_on && l > lb_) {   // the prefetched blobs (copied during the layer before) join the hits' launch
+                cudaStreamWaitEvent(cs, ev_pfd_, 0);
+                const int par = (int) (l & 1);
+                pf_merge((unsigned long long*) p_ptr, (int32_t*) p_start, pl, (unsigned long long*) p_ptr2, (int32_t*) p_start2,
+                         pf_src_d_ + par * pf_max_, pf_n_d_ + par, pf_buf_ + (size_t) par * pf_max_ * lay.max_blob,
+                         (int64_t) lay.blob_bytes(l), cs);
+            }
+            // forked: the copy reads only the plan (copied above) and writes staging and p_ptr2, which the hits do not read
+            const bool fe_fork = sink_.pcie_mode == 2 && fe_cs_ != nullptr && !prof_on_;
+            if (fe_fork) {
+                cudaEventRecord(ev_fe0_, cs);
+                cudaStreamWaitEvent(fe_cs_, ev_fe0_, 0);
+                fetch(fe_cs_, fetch_fork_blocks());
+                cudaEventRecord(ev_fe1_, fe_cs_);
+                if (pf_on && l + 1 < le_) {   // then the next layer's predicted misses (planned in pre(l)), off the critical path
+                    const int par = (int) ((l + 1) & 1);
+                    cudaStreamWaitEvent(fe_cs_, ev_pg_, 0);
+                    fetch_blobs(pf_src_d_ + par * pf_max_, pf_n_d_ + par, pf_buf_ + (size_t) par * pf_max_ * lay.max_blob,
+                                (int64_t) lay.blob_bytes(l + 1), pf_max_, fe_cs_, fetch_fork_blocks());
+                    cudaEventRecord(ev_pfd_, fe_cs_);
+                }
+            }
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
-            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-                const int64_t per = G == 2 ? staging_blobs_ / 2 : staging_blobs_;
-                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
-            }
+            if (fe_fork) cudaStreamWaitEvent(cs, ev_fe1_, 0);
+            else fetch(cs, 0);
+            if (pg_on) cudaStreamWaitEvent(cs, ev_pg_, 0);   // the prediction read this layer's residual and ids_
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
@@ -1733,6 +1874,35 @@ std::string Verifier::profile_report() {
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
     return out;
+}
+
+bool Verifier::set_prefetch_alias(const std::vector<unsigned long long>& alias) {
+    if (pf_max_ <= 0 || pg_x_ == nullptr || pf_alias_d_ != nullptr || sink_.pcie_mode != 2 || g_ == nullptr ||
+        alias.size() != (size_t) (g_->n_layers * g_->n_expert))
+        return true;
+    const size_t blob = strata::kernels::cpu::expert_layout().max_blob;
+    if (cudaMalloc(&pf_alias_d_, alias.size() * 8) != cudaSuccess || cudaMalloc(&pf_buf_, 2 * (size_t) pf_max_ * blob) != cudaSuccess ||
+        cudaMalloc(&pf_src_d_, 2 * (size_t) pf_max_ * 8) != cudaSuccess || cudaMalloc(&pf_n_d_, 2 * 4) != cudaSuccess ||
+        cudaMemcpy(pf_alias_d_, alias.data(), alias.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess) {
+        for (void** p : {(void**) &pf_alias_d_, (void**) &pf_buf_, (void**) &pf_src_d_, (void**) &pf_n_d_})
+            if (*p) { cudaFree(*p); *p = nullptr; }
+        (void) cudaGetLastError();
+        return false;
+    }
+    // the host's plan learns what was prefetched (it then gives those misses to the PCIe share, not the CPU)
+    const size_t hb = (size_t) g_->n_layers * (size_t) (pf_max_ + 1) * 4;
+    if (cudaHostAlloc(&pf_host_h_, hb, cudaHostAllocMapped) == cudaSuccess &&
+        cudaHostGetDevicePointer((void**) &pf_host_d_, pf_host_h_, 0) == cudaSuccess) {
+        for (int64_t l = 0; l < g_->n_layers; ++l) pf_host_h_[l * (pf_max_ + 1)] = -1;
+        sink_.pf_host = pf_host_h_;
+        sink_.pf_stride = pf_max_ + 1;
+    } else {
+        pf_host_d_ = nullptr;
+        (void) cudaGetLastError();
+    }
+    std::fprintf(stderr, "strata verify: GPU prefetch of the next layer's predicted misses (top-%d, up to %d a layer, %.0f MiB)\n",
+                 pg_kp_, pf_max_, 2.0 * pf_max_ * blob / 1048576.0);
+    return true;
 }
 
 // #871: is the zero-doorbell graph right for the next window?  Only while every expert of [lb_, le_) is in VRAM now
@@ -2604,14 +2774,14 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
     // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
     // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
-    cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
+    cudaError_t ie = cudaGraphInstantiate(&ex, graph, cudaGraphInstantiateFlagUseNodePriority);
     int freed = 0;
     for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
         (void) cudaGetLastError();
         if (!evict_batch_graph(key, evicted, err)) return false;
         if (evicted) {
             ++freed;
-            ie = cudaGraphInstantiate(&ex, graph, 0);
+            ie = cudaGraphInstantiate(&ex, graph, cudaGraphInstantiateFlagUseNodePriority);
         }
     }
     if (freed > 0)

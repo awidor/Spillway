@@ -208,3 +208,47 @@ Same binary; v0.2.0's kernels switched back on with `STRATA_PROMPT_MQ=0 STRATA_A
 
 The i3's CPU expert work is about half of every decode window here; the box's 6-core i7 takes a fraction of that, so
 the attention savings are a larger share of its windows.
+
+## Decode: the experts that miss the VRAM cache (11 Oct, dev server)
+
+A GPU-bound decode window (`--pcie-frac 1`, 6K prompt) spent 7.6 of 27 ms waiting for missed experts to cross PCIe
+(about 80 MB a window). The link itself gives 11.8 GB/s to both the copy kernel and the copy engine
+(`perfmodel/zc_bench.cu`), so the work was in when the copies run, not how. Each step, box flags (128K, int8 K/V,
+`--kv-grow`, MTP k=3), 128 tokens, A/B by its switch, generated tokens identical unless noted:
+
+| Step | Before | After | Switch |
+|---|---:|---:|---|
+| The PCIe copy on its own stream, beside the VRAM hits' kernels instead of after them (4 blocks) | 82.1 | 89.0 tok/s | `STRATA_FETCH_FORK=0` |
+| The window's tokens routed in one launch (the 256-expert router had one launch per token on CUDA; bitwise, `route_window_parity`) | 84.8 | 88.7 tok/s | `STRATA_ROUTE_PER_TOKEN=1` |
+| Side streams at the highest priority (`cudaGraphInstantiateFlagUseNodePriority`): their few blocks no longer wait behind whole grids | 89.0 | 90.2 tok/s | - |
+| GPU prefetch: layer l's residual through layer l+1's MoE norm and router predicts its top 8; up to 3 of them that miss VRAM are copied during layer l and joined to layer l+1's hits launch | 90.4 | 99.5 tok/s | `STRATA_PREFETCH=0`, `STRATA_PREFETCH_MAX` |
+| The fast top-k kernel (AMD's, bitwise; `cuda_router_fast`): 17.5 -> 9.2 us a call | 99.3 | 101.0 tok/s | `STRATA_ROUTER_OLD=1` |
+| IQ3_XXS dense GEMVs read the activations from shared memory (bitwise; qkv at T=3 79 -> 44 us, `perfmodel/iq_mmvq_bench.cu`) | 101.0 | 104.4 tok/s | `STRATA_IQ_MMVQ_LDS=0` |
+
+The prediction (`STRATA_PREGATE_STATS=1` scores it): top-8 a layer early names 85% of the routed experts and 71% of
+the misses (top-12: 87%, top-16: 93%, at 2-4x the copies). Wider prefetches lose: the link is shared with the
+window's own copies, its flags and the CPU's rows (top-16: 54 tok/s). The host's plan reads which experts were
+prefetched and gives them to the GPU whatever `--pcie-frac` says, so the CPU only computes unpredicted misses: at
+`--pcie-frac 0.33` decode went 60.3 -> 79.4 tok/s (tokens differ there, as between any two CPU/GPU splits).
+Correctness never depends on the host's table: the GPU joins a blob to the hits only when its own prefetch holds it.
+
+Tried and dropped: the host-side look-ahead already in the engine (`STRATA_FS_SLOTS`, CPU router + DMA): no gain, its
+copies land after the next layer is planned; 4 loads in flight a thread in the copy kernel (91 tok/s, the link's
+small control reads queue behind it); 4 or 8 rows a block in native MMVQ (no gain); shared-memory activations in
+native MMVQ (IQ4_XS 15-20% faster, Q5_K slower at T >= 3).
+
+## v0.4.0 against v0.3.0 (11 Oct), dev server
+
+The v0.3.0 kit's engine against this build, same flags as the box (`--max-context 131072 --kv int8 --kv-grow`,
+MTP k=3), 128 tokens, `perfmodel/release_ab.sh`:
+
+| | v0.3.0 | v0.4.0 | |
+|---|---:|---:|---|
+| Decode, 6K prompt, default PCIe share (two runs) | 58.1-58.4 tok/s | 81.1-82.3 tok/s | +40% |
+| Decode, 30K prompt, default PCIe share (two runs) | 51.8-52.9 tok/s | 73.6-75.0 tok/s | +42% |
+| Decode, 6K prompt, `--pcie-frac 1` | 77.2 tok/s | 104.7 tok/s | +36%, same tokens |
+| Decode, 30K prompt, `--pcie-frac 1` | 65.9 tok/s | 86.0 tok/s | +31%, same tokens |
+| Prompt read, 6K / 30K | 2.61 / 15.1 s | 2.60 / 15.1 s | unchanged |
+
+S2 now also tries `--pcie-frac 0.66` and `1`, the prefetch off and at 2 or 5 a layer, and 8 copy blocks, so the box
+picks its own CPU/PCIe split: the i3 here is far weaker than the box's i7.

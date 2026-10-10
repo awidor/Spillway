@@ -263,8 +263,7 @@ __global__ void __launch_bounds__(64) router_top10_wave_kernel(const float* __re
 }
 #endif  // STRATA_HIP_GFX906
 
-#if defined(__HIPCC__)
-// ---- S6, AMD: the same router, BIT-IDENTICAL, without its serial parts. Measured on RDNA4 (gfx1201) the kernel
+// ---- S6, AMD (and CUDA since Spillway: 17.5 -> 9.2 us a single-token call on a 2070 SUPER, 256 experts, k 8; cuda_router_fast): the same router, BIT-IDENTICAL, without its serial parts. Measured on RDNA4 (gfx1201) the kernel
 // above took 39 us per call in decode (16% of the GPU's decode time): the ascending double sum is 512 dependent FP64
 // adds (~50 cycles each there), the ten selection passes are 20 block barriers, and the renormalisation re-reads its
 // ten weights from global memory one by one.  Here:
@@ -401,34 +400,28 @@ void launch_generic(const float* logits, int n_tokens, int n_expert, int k, int*
     router_top10_kernel<<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
         logits, n_tokens, n_expert, k, ids, weights);
 }
-#endif
 
 }  // namespace
 
 bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                           void* stream, int variant) {
-#if defined(__HIPCC__)
     if (n_tokens <= 0 || n_expert <= 64 || n_expert > 512 || k <= 0 || k > 32) return false;
     if (variant < 0 || variant > 2) return false;
     launch_generic(logits, n_tokens, n_expert, k, ids, weights, stream, variant);
     return cudaGetLastError() == cudaSuccess;
-#else
-    (void) logits; (void) n_tokens; (void) n_expert; (void) k; (void) ids; (void) weights; (void) stream;
-    (void) variant;
-    return false;
-#endif
 }
 
 void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                   void* stream) {
-#if defined(__HIPCC__)
     {
 #if defined(STRATA_HIP_GFX906)
         // gfx906 (wave64): the one-wavefront kernel below stays the default; the S6 kernel is wave32-shaped and only
         // runs here on request (STRATA_HIP_ROUTER_FAST=1) until it is measured on this card
         static const bool old = std::getenv("STRATA_HIP_ROUTER_FAST") == nullptr;
-#else
+#elif defined(__HIPCC__)
         static const bool old = std::getenv("STRATA_HIP_ROUTER_OLD") != nullptr;
+#else
+        static const bool old = std::getenv("STRATA_ROUTER_OLD") != nullptr;
 #endif
         if (!old && n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32) {
             launch_generic(logits, n_tokens, n_expert, k, ids, weights, stream, 1);
@@ -447,7 +440,6 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
             return;
         }
     }
-#endif
     if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
     if (k > 64) {
         std::fprintf(stderr, "router_top10: k %d exceeds the kernel's 64\n", k);
