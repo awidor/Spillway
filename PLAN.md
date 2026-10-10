@@ -5,6 +5,9 @@
 **Machine:** Acer Predator Triton 500 PT515-51. RTX 2070 Max-Q 8 GB, i7-9750H, 16 GB of DDR4-2667, PCIe 3.0 x16,
 headless Linux, dedicated to this job. The hardware profile is dated 27.09.2026.
 
+**Context: at least 128K tokens** (`--max-context 131072`). Set on 10 Oct after the first box report; the earlier
+32K target was too low. Every speed target counts at 128K as well as on short prompts.
+
 **Approach: copy Strata, cut it down, tune it for this box.**
 
 - **The starting point:** a copy of [Strata](https://github.com/Niko1221/Strata) at the head of
@@ -47,12 +50,19 @@ All dev-PC phases are done; what is left needs the box. Measured numbers: [RESUL
   (draft length, VRAM reserve, pool workers, expert layout), starts `strata.service` (OpenAI API, port 8095) and
   checks it; `--undo` removes it. Dry run on the proxy passed. Kernel command-line settings (2b) are not applied:
   unmeasured, and each needs a reboot.
-- **S2 on the box:** not run yet. Copy `out/s2kit/` (and the model, or let it download), run `bash s2kit/s2.sh`;
-  for the llama.cpp number on the same box, `bash s1kit/s1.sh` (step 4b).
+- **S2 on the box (first report, 10 Oct):** 68.9 / 75.5 tok/s output on two short tests, 2-3.6x the Gemma service
+  it replaces; what the proxy at the box's budget predicts (142.8 x 0.51 for the 2070 Max-Q's bandwidth = 72).
+  A longer prompt crashed: #1821's int8 prompt attention on Turing, fixed (878f97b).
+- **Phase 7 (long context, 128K target):** decode attention as flash decoding for the dense selection (each window
+  reads the K/V once; 3-4x faster per layer, 30K decode 106 -> 135 tok/s on the proxy); `--kv-grow`, so the 128K K/V
+  (1.38 GB in int8) takes VRAM only as far as a request reaches and short requests keep the full expert cache;
+  S2 runs at 131072 and checks a ~117K-token request. Next: decode attention on tensor cores (at 128K it is
+  compute-bound on CUDA cores, about half of a window on the box) and prompt reading at 128K.
 
 ## 1. Summary
 
-Projected decode speed, in tok/s at a 32K context with the 3.06 bpw file. Each cell is lo / mid / hi; plan with mid.
+Projected decode speed, in tok/s at a 32K context with the 3.06 bpw file (made before the 128K target; the box
+measured 69-76 on short prompts). Each cell is lo / mid / hi; plan with mid.
 
 | Engine | No MTP | Best MTP |
 |---|---|---|
@@ -105,7 +115,7 @@ in brackets changes it. *S1* marks a fact that scouting session 1 measures.
 | **No BF16 tensor cores; FP16 `mma.m16n8k8`, int8 `mma.m8n8k16` and `dp4a` are present** | Every BF16 tensor is converted offline to FP16, or kept in FP32 where FP16's range is too small. In the 3.06 bpw file those are only in the MTP layer; the 3.53 bpw file also has BF16 attention K/V and shared experts. Decode GEMVs use no tensor cores, because Strata measured tensor-core GEMV on an RTX 2070 1.3-2.2x *slower* (3-4). |
 | **hidden 2048: every matrix except the 186-258 MiB output head is small (2-17 MB)** | Launch overhead rivals the reads. Target: at most 6 kernels per layer in one CUDA graph per window size. Count the copy's launches first (4). The doorbell round trip and the graph launch cost per node are *S1*. |
 | **DeltaNet state = 128x128 f32 per V head = 64 KB, exactly the sm_75 shared-memory limit** | Target: keep a head's state in registers across a verify window (2 blocks x 256 threads, 32 floats each), so it is read and written once per window. Check what the copied kernel does (4). |
-| **8 GB VRAM, headless** | The budget is the whole card minus the CUDA context (its size is *S1*). Prompt buffers are borrowed from the expert cache. Target: at least 5.5 GiB of expert cache at 32K context (3). |
+| **8 GB VRAM, headless** | The budget is the whole card minus the CUDA context (its size is *S1*). Prompt buffers are borrowed from the expert cache. The 128K K/V is 1.38 GB in int8; `--kv-grow` lends the expert cache whatever the current request does not use (7). |
 | **PCIe 3.0 x16, about 12-13 GB/s DMA** (a 2080 Ti on PCIe 3.0 x16 measured 13.1 in Strata's own probe; this link's real rate at 1.2 MB expert-sized copies is *S1*) | Decode: a measured share of each layer's misses goes over DMA, so the CPU and the copy engine finish together. Prompts: uncached experts stream (5.2 GiB per chunk, about 0.45 s), so chunks are compute-bound, not link-bound. |
 | **i7-9750H: Coffee Lake (Skylake core), 6C/12T, AVX2+FMA, no AVX-512, 45 W** | ggml's AVX2 i-quant kernels, which the copy uses on the CPU, build every 4-8 weights from scalar lookups in the grid and sign tables. They are limited by instruction count, not RAM: Strata measured about 5 GB/s per core even on Zen 4. The rate on this core at its sustained clock is *S1*. The copy keeps these kernels: if the CPU is the limit, a larger share of each layer's misses goes over DMA instead (S2's autotune). |
 | **6 physical cores, HT siblings share ports, nothing else runs** | 6 compute threads are pinned to physical cores. The doorbell spinner (`pause` loop) runs on an HT sibling. The OS, IRQs and server use the other siblings. The sibling numbering is *S1*. |
@@ -277,7 +287,7 @@ binary (`kit/src/scout.cu`) and the runner (`kit/s1.sh`).
 | 1 | 30 s | Install the engine, pack, config, systemd unit and an **undo script** that restores every file and setting it changes. |
 | 2 | 2 min | Apply section 2b (kernel command line, governor, persistence and compute mode), then **reboot once, early**. Everything after runs on the final OS. A one-shot systemd unit resumes the run after the reboot. |
 | 3 | 8 min | **Autotune** of the choices only the box can settle. These are pre-ranked on the proxy. Each trial is a short decode benchmark, and the tuner keeps the best so far when the budget runs out. The choices: CPU worker count and doorbell placement, DMA miss share (auto against fixed), the 36-SM launch-shape variants, `MMVQ_IL` variants, the expert-cache margin, MTP draft length k = 2-4, and the GPU clock lock (if S1 showed it helps). |
-| 4 | 6 min | **Validation with the winning config:** the S1 workloads (8K and 32K, MTP on), then sustained decode until the budget ends. This doubles as the long thermal check. |
+| 4 | 6 min | **Validation with the winning config:** the S1 workloads (8K, 32K and 128K, MTP on), then sustained decode until the budget ends. This doubles as the long thermal check. |
 | 5 | 10 s | Archive the results. The service stays running with the winning config. |
 
 ## 6. Phases and gates
@@ -289,11 +299,12 @@ binary (`kit/src/scout.cu`) and the runner (`kit/s1.sh`).
 | 1 | Copy, strip, load byteshape's file, parity | dev PC | `engine/` builds for 75;86 and passes parity on the 3.06 bpw file |
 | 2 | Proxy baseline at the box's budget (8 GB minus the CUDA context) | dev PC | the copy's tok/s and slot count; this model's hit-rate curve; refit |
 | | **Gate G1:** on the proxy, the copy must reach at least 1.5x llama.cpp `--moe-cache-mib` at the same VRAM budget (llama.cpp: 73-89 tok/s on the 3080 in the dry run). Otherwise deploy llama.cpp in S2 and stop. | | |
-| 3 | VRAM accounting | dev PC | at least 45% of experts cached at 32K context |
+| 3 | VRAM accounting | dev PC | at least 45% of experts cached on short prompts, the 128K K/V grown on demand |
 | 4 | Turing kernels, launch fusion, switch sweep | dev PC | the sm_75 work from four PRs; ranked candidates for S2's autotune |
 | 5 | MTP for this file | dev PC | the Q5_K MTP experts running natively, a draft vocab, ranked k |
 | 6 | Server cut to the OpenAI API; config; the S2 kit (installer, undo, resume, autotune) | dev PC | the S2 kit, dry-run on the proxy |
 | S2 | **Deployment and on-device tuning** (≤ 20 min) | box | the final config running; the final number |
+| 7 | Long context (128K target): decode attention, elastic K/V, prompt reading at 128K | dev PC, then box | decode and prompt speed at 128K on the proxy at the box's budget, then on the box |
 
 ### Phase 1: copy and strip
 
@@ -330,7 +341,7 @@ are the template.
 - PCIe stays at the 3080's Gen4: the model scales the PCIe terms to S1's measured link instead of a BIOS change.
 
 **Measure:**
-- the copy against llama.cpp, at 1K, 8K and 32K, MTP on and off;
+- the copy against llama.cpp, at 1K, 8K, 32K and 128K, MTP on and off;
 - the copy's expert slot count;
 - whether low-RAM mode adapts its VRAM set;
 - routing traces with `--dump-routing` over a few hundred prompts (code, chat, German), which give the hit-rate

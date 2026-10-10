@@ -7,6 +7,7 @@ model on one machine:
   ([byteshape/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/byteshape/Qwen3.6-35B-A3B-MTP-GGUF)), used as published.
 - **Box:** a headless Linux machine with an RTX 2070 Max-Q (8 GB, Turing), an i7-9750H (6 cores), 16 GB of DDR4 and
   PCIe 3.0.
+- **Context:** at least 128K tokens.
 
 The 13.6 GB model does not fit in 8 GB of VRAM. The engine keeps every expert in pinned RAM and the most used ones in a
 VRAM cache, computes the misses on the CPU in place (or copies them over PCIe), and drafts with the model's own MTP
@@ -14,7 +15,8 @@ layer.
 
 ## Status
 
-Built and measured on a stand-in (RTX 3080 10 GB in WSL2, Ryzen 7 5700X); not yet run on the box.
+On the box (first report): 69-76 tok/s output on short requests, 2-3.6x the Gemma service it replaces. The rest was
+measured on a stand-in (RTX 3080 10 GB in WSL2, Ryzen 7 5700X):
 
 | On the stand-in, 3.06 bpw file | Decode tok/s |
 |---|---:|

@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -488,6 +489,230 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
+// ---- dense flash decoding (qsa_decode_attn_dense), int8 K/V: block (split, kv head, query group) takes tiles split,
+// split + n_split, ... of TC cells for all NQB queries at once.  Each tile's K and V rows are staged in shared memory
+// with every load in flight together, then scored and folded from there (an online softmax per row).  A query's
+// cells past its own width only add zero weights and an alpha of 1, so its result does not depend on the group's
+// other queries.
+constexpr int DG = 8;   // query heads per KV head; warp h scores head h
+constexpr int TC = 32;  // cells per tile: K + V tiles 16 KB, so two blocks fit a Turing SM's 64 KB
+
+// 8 int8 codes as exact floats: 2^23 + (c + 128) assembled by byte permutes, then one subtract (no I2F)
+__device__ __forceinline__ void codes8(uint2 raw, float* out) {
+    const uint32_t w[2] = {raw.x ^ 0x80808080u, raw.y ^ 0x80808080u};
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) out[4 * i + j] = __uint_as_float(__byte_perm(w[i], 0x4B000000u, 0x7440 + j)) - 8388736.0f;
+}
+// N lane partials (a power of two <= 32) summed over the warp and scattered: each sum pairs lanes as warp_sum does
+// (xor 16 .. 1), for N - 1 + log2(32 / N) shuffles instead of 5 N.  Lane l ends with value rs_index<N>(l).
+template <int N, int O = 16>
+__device__ __forceinline__ float reduce_scatter(const float (&v)[N], int lane) {
+    if constexpr (N == 1) {
+        float x = v[0];
+#pragma unroll
+        for (int o = O; o > 0; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
+        return x;
+    } else {
+        constexpr int H = N / 2;
+        const bool hi = (lane & O) != 0;
+        float w[H];
+#pragma unroll
+        for (int i = 0; i < H; ++i) w[i] = (hi ? v[i + H] : v[i]) + __shfl_xor_sync(0xffffffffu, hi ? v[i] : v[i + H], O);
+        return reduce_scatter<H, O / 2>(w, lane);
+    }
+}
+template <int N, int O = 16>
+__device__ __forceinline__ int rs_index(int lane) {
+    if constexpr (N == 1) return 0;
+    else return ((lane & O) ? N / 2 : 0) + rs_index<N / 2, O / 2>(lane);
+}
+
+template <int NQB>
+__global__ void __launch_bounds__(THREADS) attn_dense_kernel(const float* __restrict__ q, QsaAttnPools p,
+                                                             const int32_t* __restrict__ steps, int nq, int n_kv_heads,
+                                                             int page_size, float scale, float* __restrict__ part_acc,
+                                                             float* __restrict__ part_m, float* __restrict__ part_l,
+                                                             int n_split, long long scratch_stride) {
+    constexpr int R = NQB * DG;    // rows: query qi's head h is row qi * DG + h
+    constexpr int RP = R + 4;      // padded (softmax reads a row down the cells), float4-aligned
+    constexpr int NC = 4;          // cells per score step
+    constexpr int NV = NC * NQB;   // partials reduced per step
+    constexpr int GR = HD / KV_Q8_GROUP;   // scale groups per row
+    __shared__ __align__(16) int8_t sk[TC][HD];
+    __shared__ __align__(16) int8_t sv[TC][HD];
+    __shared__ float sks[TC][GR], svs[TC][GR];
+    __shared__ __align__(16) float sp[TC][RP];   // scores, then weights, cell-major for the value loop
+    __shared__ long long srow[TC];
+    __shared__ float salpha[R];
+    __shared__ int swidth[NQB];
+    const int split = blockIdx.x, kvh = blockIdx.y, q0 = blockIdx.z * NQB;
+    const int t = threadIdx.x, lane = t & 31, h = t >> 5;
+    if (t < NQB) swidth[t] = q0 + t < nq ? __ldg(steps + (size_t) (q0 + t) * kStepCount + kStepWidth) : 0;
+    float qr[NQB][8];   // this lane's 8 dimensions of each query's head h
+#pragma unroll
+    for (int qi = 0; qi < NQB; ++qi) {
+        if (q0 + qi < nq) {
+            const float4* src = reinterpret_cast<const float4*>(
+                q + ((size_t) (q0 + qi) * n_kv_heads * DG + (size_t) kvh * DG + h) * HD + lane * 8);
+            const float4 a = src[0], b = src[1];
+            qr[qi][0] = a.x; qr[qi][1] = a.y; qr[qi][2] = a.z; qr[qi][3] = a.w;
+            qr[qi][4] = b.x; qr[qi][5] = b.y; qr[qi][6] = b.z; qr[qi][7] = b.w;
+        } else {
+#pragma unroll
+            for (int d = 0; d < 8; ++d) qr[qi][d] = 0.0f;
+        }
+    }
+    float m_run[NQB], l_run[NQB], acc[R];
+#pragma unroll
+    for (int qi = 0; qi < NQB; ++qi) { m_run[qi] = -FLT_MAX; l_run[qi] = 0.0f; }
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    __syncthreads();
+    int wmax = 0;
+#pragma unroll
+    for (int qi = 0; qi < NQB; ++qi) wmax = max(wmax, swidth[qi]);
+    for (int tile = split; tile * TC < wmax; tile += n_split) {
+        const int c0 = tile * TC;
+        if (t < TC) srow[t] = c0 + t < wmax ? cell_row(p, c0 + t, kvh, n_kv_heads, page_size) : -1;
+        __syncthreads();
+        // stage the tile: 16 x 16 B per row and side, 4 loads per thread in flight; a masked row is zeros
+        {
+            uint4 kx[2], vx[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int e = t + i * THREADS, cell = e / (HD / 16), off = (e % (HD / 16)) * 16;
+                const long long row = srow[cell];
+                kx[i] = vx[i] = make_uint4(0, 0, 0, 0);
+                if (row != -1) {
+                    const long long r = row >= 0 ? row : -2 - row;
+                    kx[i] = *reinterpret_cast<const uint4*>((row >= 0 ? p.k_q : p.host_k_q) + r * HD + off);
+                    vx[i] = *reinterpret_cast<const uint4*>((row >= 0 ? p.v_q : p.host_v_q) + r * HD + off);
+                }
+            }
+            float ksc = 0.0f, vsc = 0.0f;
+            if (t < TC * GR) {
+                const long long row = srow[t / GR];
+                if (row != -1) {
+                    const long long r = (row >= 0 ? row : -2 - row) * GR + t % GR;
+                    ksc = __half2float(__ushort_as_half((row >= 0 ? p.k_scale : p.host_k_scale)[r]));
+                    vsc = __half2float(__ushort_as_half((row >= 0 ? p.v_scale : p.host_v_scale)[r]));
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int e = t + i * THREADS, cell = e / (HD / 16), off = (e % (HD / 16)) * 16;
+                *reinterpret_cast<uint4*>(&sk[cell][off]) = kx[i];
+                *reinterpret_cast<uint4*>(&sv[cell][off]) = vx[i];
+            }
+            if (t < TC * GR) { sks[t / GR][t % GR] = ksc; svs[t / GR][t % GR] = vsc; }
+        }
+        __syncthreads();
+        // scores: warp h, NC cells per step, lanes split the 256 dimensions
+#pragma unroll 2
+        for (int c = 0; c < TC; c += NC) {
+            float part[NV];   // [cell j][query qi]
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                float k8[8];
+                codes8(*reinterpret_cast<const uint2*>(&sk[c + j][lane * 8]), k8);
+                const float sc = sks[c + j][lane * 8 / KV_Q8_GROUP];
+#pragma unroll
+                for (int qi = 0; qi < NQB; ++qi) {
+                    const float* a = qr[qi];
+                    const float s = k8[0] * a[0] + k8[1] * a[1] + k8[2] * a[2] + k8[3] * a[3] + k8[4] * a[4] +
+                                    k8[5] * a[5] + k8[6] * a[6] + k8[7] * a[7];
+                    part[j * NQB + qi] = s * sc;
+                }
+            }
+            const float sum = reduce_scatter<NV>(part, lane);
+            if ((lane & (32 / NV - 1)) == 0) {   // the lowest of the lanes holding this value
+                const int v = rs_index<NV>(lane), j = v / NQB, qi = v % NQB, cell = c + j;
+                sp[cell][qi * DG + h] = (srow[cell] != -1 && c0 + cell < swidth[qi]) ? sum * scale : -FLT_MAX;
+            }
+        }
+        __syncthreads();
+        // online softmax: warp h owns rows qi * DG + h, a cell per lane; masked cells (-FLT_MAX) weigh 0
+#pragma unroll
+        for (int qi = 0; qi < NQB; ++qi) {
+            const int r = qi * DG + h;
+            const float a = sp[lane][r];
+            const float mn = fmaxf(m_run[qi], warp_max(a));
+            const float alpha = __expf(m_run[qi] - mn);
+            const float ea = a > -FLT_MAX ? __expf(a - mn) : 0.0f;
+            sp[lane][r] = ea;
+            l_run[qi] = l_run[qi] * alpha + warp_sum(ea);
+            m_run[qi] = mn;
+            if (lane == 0) salpha[r] = alpha;
+        }
+        __syncthreads();
+        // values: thread t owns dimension t of every row
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[r] *= salpha[r];
+#pragma unroll 4
+        for (int c = 0; c < TC; ++c) {
+            const float v = (float) sv[c][t] * svs[c][t / KV_Q8_GROUP];
+            const float4* w4 = reinterpret_cast<const float4*>(sp[c]);
+#pragma unroll
+            for (int i = 0; i < R / 4; ++i) {
+                const float4 w = w4[i];
+                acc[4 * i] = fmaf(w.x, v, acc[4 * i]);
+                acc[4 * i + 1] = fmaf(w.y, v, acc[4 * i + 1]);
+                acc[4 * i + 2] = fmaf(w.z, v, acc[4 * i + 2]);
+                acc[4 * i + 3] = fmaf(w.w, v, acc[4 * i + 3]);
+            }
+        }
+        __syncthreads();   // the next tile rewrites the shared tiles
+    }
+    // one partial per (split, kv head) in attn_merge_kernel's layout, with n_split as its chunk count; folded by
+    // attn_merge_dense_kernel
+    const int slot = kvh * n_split + split;
+#pragma unroll
+    for (int qi = 0; qi < NQB; ++qi) {
+        if (q0 + qi >= nq) break;
+        const size_t base = (size_t) (q0 + qi) * (size_t) scratch_stride;
+#pragma unroll
+        for (int hh = 0; hh < DG; ++hh) part_acc[base + ((size_t) slot * DG + hh) * HD + t] = acc[qi * DG + hh];
+        if (lane == 0) {
+            part_m[base + slot * DG + h] = m_run[qi];
+            part_l[base + slot * DG + h] = l_run[qi];
+        }
+    }
+}
+
+// attn_merge_kernel's fold (the same fmaf order) for the dense path's few splits: the maxima and weights are
+// computed once per block in shared memory, and the partial loads have no branch between them, so they overlap
+constexpr int MAX_SPLIT = 256;
+__global__ void __launch_bounds__(HD) attn_merge_dense_kernel(const float* __restrict__ part_acc,
+                                                              const float* __restrict__ part_m,
+                                                              const float* __restrict__ part_l, int n_split,
+                                                              float* __restrict__ attn, long long scratch_stride) {
+    part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
+    attn += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
+    __shared__ float sm[MAX_SPLIT], sl[MAX_SPLIT];
+    const int h = blockIdx.x, kvh = h / DG, hl = h % DG, d = threadIdx.x;
+    for (int c = d; c < n_split; c += HD) {
+        sm[c] = part_m[(kvh * n_split + c) * DG + hl];
+        sl[c] = part_l[(kvh * n_split + c) * DG + hl];
+    }
+    __syncthreads();
+    float M = -FLT_MAX;
+    for (int c = 0; c < n_split; ++c) M = fmaxf(M, sm[c]);
+    __syncthreads();
+    for (int c = d; c < n_split; c += HD) sm[c] = sm[c] == -FLT_MAX ? 0.0f : __expf(sm[c] - M);   // an empty split: 0
+    __syncthreads();
+    float L = 0.0f, acc = 0.0f;
+#pragma unroll 8
+    for (int c = 0; c < n_split; ++c) {
+        L = fmaf(sl[c], sm[c], L);
+        acc = fmaf(part_acc[((size_t) (kvh * n_split + c) * DG + hl) * HD + d], sm[c], acc);
+    }
+    attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
+}
+
 #if defined(STRATA_ATTN_PRE75_BUILT)
 // CUDA: the current device is below sm_75; HIP: it is gfx103x (per device: a layer split can mix cards).
 // STRATA_ATTN_PRE75=0 turns PR #540's kernel off (A/B); on HIP =1 also runs it on another wave32 card.
@@ -601,6 +826,52 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         decode_attn_step_g<8>(q, pools, ids, step, cap, s, scratch, attn, stream);
     else
         decode_attn_step_g<G_FLASH>(q, pools, ids, step, cap, s, scratch, attn, stream);
+}
+
+namespace {
+// splits per KV head: one per SM (the card's own count, so a query's summation order is fixed per card)
+int dense_splits() {
+    static int sms[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
+    if (sms[dev] == 0 && cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return sms[dev];
+}
+}  // namespace
+
+bool qsa_decode_attn_dense(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t cap,
+                           const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    static const bool off = [] { const char* v = std::getenv("STRATA_ATTN_DENSE"); return v && v[0] == '0'; }();
+    const bool int8_kv = pools.k_q && pools.v_q && pools.k_scale && pools.v_scale && !pools.k_q4 && !pools.v_q4;
+    if (off || !int8_kv || s.head_dim != HD || s.n_head_kv <= 0 || s.n_head != DG * s.n_head_kv || cap <= 0 ||
+        !scratch || !steps || !pools.page_table || n_q > 65535)
+        return false;
+    if (n_q <= 0) return true;
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const int n_split = std::min({n_chunks, dense_splits(), MAX_SPLIT});
+    if (n_split <= 0) return false;
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    float* pa = scratch;
+    float* pm = scratch + (size_t) n_chunks * s.n_head * HD;
+    float* pl = pm + (size_t) n_chunks * s.n_head;
+    const float scale = 1.0f / sqrtf((float) HD);
+    const int nqb = n_q == 1 ? 1 : n_q == 2 ? 2 : 4;
+    const dim3 grid((unsigned) n_split, (unsigned) s.n_head_kv, (unsigned) ((n_q + nqb - 1) / nqb));
+    cudaStream_t st = (cudaStream_t) stream;
+    const int nq = (int) n_q, n_kv = (int) s.n_head_kv, ps = (int) s.page_size;
+    if (nqb == 1) attn_dense_kernel<1><<<grid, THREADS, 0, st>>>(q, pools, steps, nq, n_kv, ps, scale, pa, pm, pl, n_split, stride);
+    else if (nqb == 2) attn_dense_kernel<2><<<grid, THREADS, 0, st>>>(q, pools, steps, nq, n_kv, ps, scale, pa, pm, pl, n_split, stride);
+    else attn_dense_kernel<4><<<grid, THREADS, 0, st>>>(q, pools, steps, nq, n_kv, ps, scale, pa, pm, pl, n_split, stride);
+    attn_merge_dense_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(pa, pm, pl, n_split, attn, stride);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_decode_attn_dense: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
 }
 
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {

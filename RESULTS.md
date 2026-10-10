@@ -62,6 +62,21 @@ Install + pack 10 s; tuning 9 engine starts (~15 s each); service up and answeri
 
 Through the service: 160.8 tok/s decode, drafts 227/270. `--undo` removed the service and /opt/strata.
 
+## On the box: first report (10 Oct)
+
+RTX 2070 Max-Q 8 GB, i7-9750H, `strata.service` with S2's tuned settings, against the Gemma service it replaces.
+Output tokens/s per request, one run each, each model counted with its own tokenizer.
+
+| Test | Gemma | Spillway |
+|---|---:|---:|
+| Field extraction | 35.1 | **68.9** |
+| Factual text | 21.0 | **75.5** |
+| Longer prompt | ok | GPU illegal memory access (fixed below) |
+
+Check: the proxy at the box's budget gave 142.8 tok/s. Decode there is bound by reading cached experts from VRAM,
+and the 2070 Max-Q has 384 GB/s against the 3080's 760 (0.51x): 142.8 x 0.51 = 72 tok/s expected, 69-76 measured.
+Inside PLAN.md's projection (63 / 115 / 173 lo / mid / hi with MTP), near lo.
+
 ## Fix: long prompts crashed on Turing (laptop report, 10 Oct)
 
 On the box, a longer prompt failed with a GPU illegal memory access. It reproduces on the proxy with
@@ -77,3 +92,33 @@ and fp16, ctx 8K and 32K).
 | 6,019 tokens, EMULATE_CC=75 | illegal memory access | 2,498 | 112.2 |
 | 30,019 tokens, EMULATE_CC=75 | — | 1,779 | 29.8 |
 | 30,019 tokens, native sm_86 | — | 1,858 | 66.6 |
+
+## Phase 7: long context (128K target, 10 Oct)
+
+The target moved to 128K tokens. qwen35moe attends every cell, and the batched decode-attention kernel read the whole
+K/V once per window token, then merged one partial per 64 cells serially. New: flash decoding for the dense
+selection (int8 K/V): a block per (SM-sized split, KV head, up to 4 window tokens) stages each 32-cell tile in shared
+memory once, keeps an online softmax per row, and the merge folds one partial per split with its loads in flight.
+Each token's result is the same alone as in its window (bit for bit); against the batched kernel the largest
+difference is 3e-9 (`perfmodel/attn_bench.cu`, which exits non-zero otherwise).
+
+| Attention per layer, proxy, int8 K/V | Batched kernel | Flash decoding |
+|---|---:|---:|
+| 6K cells, 1 / 4 tokens | 121 / 261 us | 41 / 71 us |
+| 30K cells, 1 / 4 tokens | 424 / 1,050 us | 122 / 256 us |
+| 128K cells, 1 / 4 tokens | 1,739 / 4,070 us | 425 / 919 us |
+
+End to end, `STRATA_EMULATE_CC=75`, MTP k=3, `--kv int8`, 128 tokens (`STRATA_ATTN_DENSE=0` = the batched kernel):
+
+| Prompt | Batched | Flash decoding |
+|---|---|---|
+| 6K tokens | 13.9 ms/window, 156 tok/s | 13.1 ms/window, 157 tok/s |
+| 30K tokens | 19.5 ms/window, 106 tok/s | 14.4 ms/window, **135 tok/s** |
+| 120K tokens, `--max-context 131072 --kv-grow` | not run | 22.1 ms/window, **89 tok/s**; prompt read 149 s (805 tok/s) |
+
+`--kv-grow` at `--max-context 131072`: the expert cache starts at 5,464 slots (5.86 GiB) instead of 4,335 (4.65 GiB)
+with the whole 128K K/V allocated (1.38 GB int8), and gives slots back only as a request's context grows. S2 now
+runs `--max-context 131072 --kv int8 --kv-grow` and checks one ~117K-token request through the API.
+
+Left at 128K: decode attention is compute-bound on CUDA cores at 4 tokens (145 GB/s of K/V); tensor cores are the
+next step. Prompt reading at 120K is 805 tok/s on the proxy, so about 2.5 minutes there and more on the box.

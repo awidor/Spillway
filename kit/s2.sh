@@ -13,7 +13,7 @@ FILE=Qwen3.6-35B-A3B-IQ3_S-3.06bpw.gguf
 SIZE=13609247424
 URL=https://huggingface.co/byteshape/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/$FILE
 HOST=${HOST:-127.0.0.1}
-CTX=32768
+CTX=131072   # the target: at least 128K tokens of context
 say() { echo "[$(date +%T)] $*"; }
 
 if [ "${1:-}" = "--undo" ]; then
@@ -64,7 +64,7 @@ sudo nvidia-smi -pm 1 >/dev/null 2>&1 || say "note: persistence mode not support
 # ---- tune: one decode benchmark per candidate, each a fresh engine start at the production context
 BASE=(--pack $DEST/pack --native "$M" --expert-profile $DEST/data/expert-profile-qwen36.bin --expert-cache auto
       --prefill auto --spec-min-p 0.5 --mtp "$M" --mtp-draft-vocab $DEST/data/draft_vocab.bin
-      --max-context $CTX --kv int8)
+      --max-context $CTX --kv int8 --kv-grow)   # --kv-grow: the K/V takes VRAM only as far as a request reaches
 PROMPT=$($DEST/venv/bin/python -c '
 import sys; sys.path.insert(0, "'$DEST'/tools")
 import strata_tokenizer as ST
@@ -129,4 +129,14 @@ curl -s -m 120 localhost:8095/v1/chat/completions -H 'Content-Type: application/
   -d '{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"Write a haiku about a quiet server room."}],"max_tokens":1500}' |
   $DEST/venv/bin/python -c 'import json,sys; r=json.load(sys.stdin); t=r["timings"]
 m = r["choices"][0]["message"]; print(m.get("content") or "(still thinking at max_tokens: %d reasoning chars)" % len(m.get("reasoning_content") or "")); print("decode %.1f tok/s, prompt %.1f tok/s, drafts %s/%s" % (t["predicted_per_second"], t["prompt_per_second"], t.get("draft_n_accepted"), t.get("draft_n")))'
+# ---- the context target: one ~117K-token request (the prompt read and decode at the far end of the K/V)
+say "long-context check (~117K tokens; reading the prompt takes a few minutes)"
+$DEST/venv/bin/python -c '
+import json
+rec = "\n".join(f"Record {i}: sensor {i % 97} read {i * 7 % 1000} units at minute {i % 1440}." for i in range(4900))
+q = "\n\nWhich sensor did record 4321 use? Answer with the number only."
+print(json.dumps({"model": "qwen3.6-35b-a3b", "messages": [{"role": "user", "content": rec + q}], "max_tokens": 512}))' |
+  curl -s -m 1200 localhost:8095/v1/chat/completions -H 'Content-Type: application/json' -d @- |
+  $DEST/venv/bin/python -c 'import json,sys; r=json.load(sys.stdin); t=r["timings"]; m=r["choices"][0]["message"]
+print("answer: %r (expected 53)" % (m.get("content") or "(still thinking at max_tokens)")); print("prompt %d tokens at %.1f tok/s, decode %.1f tok/s, drafts %s/%s" % (r["usage"]["prompt_tokens"], t["prompt_per_second"], t["predicted_per_second"], t.get("draft_n_accepted"), t.get("draft_n")))'
 say "done: strata.service is running (journalctl -u strata -f); tuning results in $DEST/tune.csv"

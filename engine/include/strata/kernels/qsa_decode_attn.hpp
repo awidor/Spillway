@@ -54,5 +54,12 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 /// [n_q, kStepCount], attn [n_q, n_head, 256]; scratch is `n_q` times the single-query size.
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+/// The same for a dense selection (every query attends cells 0..width-1, as qsa_select_all writes; no ids), as flash
+/// decoding: each block reads its share of the K/V once for up to 4 queries and keeps an online softmax, so the
+/// merge folds one partial per SM instead of one per 64 cells. 8 query heads per KV head (Qwen3.6) only; returns
+/// false (nothing launched) otherwise or with STRATA_ATTN_DENSE=0, and the caller runs qsa_decode_attn_batch.
+/// A query's result depends on the card's SM count, not on the other queries in the call. Same scratch.
+bool qsa_decode_attn_dense(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t cap,
+                           const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
 }  // namespace strata::kernels

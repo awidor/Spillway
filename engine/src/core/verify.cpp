@@ -1288,6 +1288,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         }
                         qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
+                        if (idx || !qsa_decode_attn_dense(qcur_ + t * NH * HD, px, step_ + t * kStepCount, cap_, s,
+                                                          attn_scratch_ + (size_t) t * attn_scratch_floats_,
+                                                          attn_ + t * NH * HD, 1, cs))
                         qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
                                               cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
                                               attn_ + t * NH * HD, 1, cs);
@@ -1306,6 +1309,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 12, grp);
                 if (qbr) join(0);   // the query, for attention
                 const QsaAttnPools pools = qsa_attn_pools(st);
+                // qwen35moe (no indexer) attends every cell: the dense flash-decoding kernel, the batched one otherwise
+                if (idx || !qsa_decode_attn_dense(qcur_ + tb * NH * HD, pools, step_ + tb * kStepCount, cap_, s,
+                                                  attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD,
+                                                  n, cs))
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }

@@ -16,6 +16,7 @@ Not a fork: nothing here goes upstream. `README.md` and `docs/` are upstream's a
 | Missing `<cstdint>` include | `include/strata/core/vram_floor.hpp` |
 | Merged: #1821 (Turing int8 K/V prompt attention), #1825 (Turing 4-lane prompt scorer) | `src/kernels/cuda/qsa_prompt_attn.cu`, `src/kernels/cuda/qsa_select.cu`, their parity tests, `CMakeLists.txt` |
 | Fix: #1821's int8 prefetch read `ids` without the dense (null ids) check, an illegal address on Turing for long prompts; the parity test now checks dense against ids 0..w-1 bit for bit | `src/kernels/cuda/qsa_prompt_attn.cu`, `src/kernels/qsa_prompt_attn_parity.cpp` |
+| Decode attention for a dense selection (qwen35moe, int8 K/V) as flash decoding: one K/V read per window, one partial per SM, a merge with its loads in flight; the batched kernel stays for sparse selections and other formats (`STRATA_ATTN_DENSE=0` turns it off) | `src/kernels/cuda/qsa_decode_attn.cu`, its header, `src/core/verify.cpp`, `src/core/mtp.cpp` |
 | Removed: SYCL engine, installer (`setup.py` and its tests), MCP server tool, Docker files, Windows launchers, translated READMEs | |
 | Line endings normalized to LF | all text files |
 
