@@ -1,0 +1,5 @@
+out/
+engine/third_party/llama.cpp/
+__pycache__/
+*.pyc
+*.gguf
