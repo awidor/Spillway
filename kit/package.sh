@@ -18,7 +18,7 @@ cp -r $E/third_party/llama.cpp/gguf-py $K/gguf-py && rm -rf $K/gguf-py/tests
 cp /src/kit/{install.sh,spillway,requirements.txt} $E/chat.py $K/
 chmod +x $K/install.sh $K/spillway $K/bin/strata
 find $K -type f \( -name '*.sh' -o -name '*.py' -o -name '*.txt' -o -name spillway \) | xargs sed -i 's/\r$//'
-V=$(git -c safe.directory=/src -C /src describe --tags --always --dirty 2>/dev/null || echo dev)
+V=${SPILLWAY_VERSION:-dev}   # from ./dev.sh: the image's git refuses a checkout it does not own
 { echo "Spillway $V, built $(date -u +%F)"; echo "engine: Strata 650cf81 + the changes in engine/SOURCE.md"; nvcc --version | tail -1; } > $K/VERSIONS
 LD_LIBRARY_PATH= ldd $K/bin/strata | grep -E "not found" && { echo "unbundled dependency"; exit 1; }
 tar -C /src/out -czf $R/spillway-linux-x86_64.tar.gz spillway

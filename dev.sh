@@ -25,7 +25,7 @@ case "${1:-}" in
     fi
     echo "ready: ./dev.sh build" ;;
   build) shift; "${RUN[@]}" -e TARGETS="${*:-strata}" $IMG bash /src/kit/build_engine.sh ;;
-  package) "${RUN[@]}" $IMG bash /src/kit/package.sh ;;
+  package) "${RUN[@]}" -e SPILLWAY_VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)" $IMG bash /src/kit/package.sh ;;
   test)
     docker run --rm -v "$ROOT:/src" -w /src/engine python:3.12-slim bash -o pipefail -c \
       'pip install -q --root-user-action=ignore --disable-pip-version-check -r /src/kit/requirements.txt pillow &&

@@ -20,5 +20,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --draft --title "Spillway $GITHUB_REF_NAME" --notes "" \
-            out/release/spillway-linux-x86_64.tar.gz out/release/spillway-linux-x86_64.tar.gz.sha256 out/release/install.sh
+          A="out/release/spillway-linux-x86_64.tar.gz out/release/spillway-linux-x86_64.tar.gz.sha256 out/release/install.sh"
+          # a tag pushed again (a rebuilt release) replaces the assets of its release
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && gh release upload "$GITHUB_REF_NAME" $A --clobber ||
+            gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --notes "" $A

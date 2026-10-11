@@ -119,7 +119,7 @@ if [ $MODE = install ]; then
   if grep -qs /opt/strata/serve/server.py /etc/systemd/system/strata.service; then
     say "removing the v0.4 install"
     remove_unit strata.service
-    sudo mkdir -p $DEST && [ -f /opt/strata/undo.env ] && sudo cp -n /opt/strata/undo.env $DEST/
+    sudo mkdir -p $DEST && [ -f /opt/strata/undo.env ] && [ ! -f $DEST/undo.env ] && sudo cp /opt/strata/undo.env $DEST/
     sudo rm -rf /opt/strata
   fi
   sudo systemctl stop spillway.service 2>/dev/null || true
