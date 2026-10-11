@@ -19,7 +19,7 @@ if (hk) {
 }
 
 // ------------------------------------------------------------------ the heatmap: layers x experts
-let heat = null;   // {layers, experts, cells: [{e, r, h}] per layer, sorted}
+let heat = null;   // {layers, experts, cells: [{e, r, h}] per layer, in expert order}
 function hexColor(c) {
   const x = document.createElement("canvas").getContext("2d");
   x.fillStyle = c;
@@ -36,7 +36,6 @@ function drawHeat(ex) {
         const i = l * E + e;
         row.push({e, r: ex.resident[i] === "1", h: parseInt(ex.heat[i], 16) / 15});
       }
-      row.sort((a, b) => b.h - a.h || b.r - a.r || a.e - b.e);
       cells.push(row);
     }
     heat = {layers: L, experts: E, cells, time: ex.time};
