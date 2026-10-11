@@ -2,6 +2,12 @@
 
 All measurements: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
+## v0.5.1
+
+- Dashboard: a token trace next to the expert heatmap. It shows the 8 experts each layer picked for the token being
+  written and where each one ran (VRAM, prefetched over PCIe, copied over PCIe, CPU), plus the last 20 tokens' misses
+  per layer. The latest picks are outlined on the heatmap, which now shows experts in ID order.
+
 ## v0.5.0
 
 - One-line install: `curl -fsSL https://github.com/awidor/Spillway/releases/latest/download/install.sh | bash`. It checks
