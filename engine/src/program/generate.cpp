@@ -9076,6 +9076,23 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            if (line.rfind("EXPERTS", 0) == 0) {   // Spillway's dashboard, between requests
+                // EXPERTS <layers> <experts> <one char per (layer, expert): 1 = in VRAM> <one hex digit each: the decayed
+                // routing counts of the adaptive tier, square-root scaled to its maximum; all 0 while it is off>
+                const size_t n = (size_t) (g.n_layers * g.n_expert);
+                std::string res(n, '0'), heat(n, '0');
+                for (size_t i = 0; i < n && i < host_res.size(); ++i)
+                    if (host_res[i] >= 0) res[i] = '1';
+                float top = 0.0f;
+                for (const float u : drive.d.usage) top = std::max(top, u);
+                if (top > 0.0f && drive.d.usage.size() == n)
+                    for (size_t i = 0; i < n; ++i)
+                        heat[i] = "0123456789abcdef"[std::lround(15.0f * std::sqrt(std::max(0.0f, drive.d.usage[i]) / top))];
+                std::printf("EXPERTS %lld %lld %s %s\n", (long long) g.n_layers, (long long) g.n_expert, res.c_str(),
+                            heat.c_str());
+                std::fflush(stdout);
+                continue;
+            }
             admit_slot = -1;
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;

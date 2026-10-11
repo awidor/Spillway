@@ -921,6 +921,29 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def experts(self, timeout: float = 10.0) -> dict | None:
+        """Spillway: `EXPERTS` between requests (the caller holds the service's FIFO) -> {"layers", "experts",
+        "resident", "heat"}: one character per (layer, expert), "1" = in VRAM, and a hex digit of its routing heat.
+        None when the engine does not answer it (an older engine)."""
+        if not self.alive():
+            return None
+        self.proc.stdin.write("EXPERTS\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                return None
+            if line is None:
+                raise EngineDied("the engine ended")
+            f = line.split()
+            if f and f[0] == "ERR":
+                return None
+            if len(f) == 5 and f[0] == "EXPERTS":
+                return {"layers": int(f[1]), "experts": int(f[2]), "resident": f[3], "heat": f[4]}
+        return None
+
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
@@ -2602,6 +2625,7 @@ class Service:
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
+        self.experts_view = None                         # Spillway: the engine's EXPERTS answer, for the dashboard
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -2657,6 +2681,27 @@ class Service:
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+
+    def watch_experts(self, every_s: float = 2.0) -> None:
+        """Spillway: ask the engine for its experts (EXPERTS) after each finished request, only while it is idle (the
+        FIFO is free, no batch slots), so a request never waits on it."""
+        def loop():
+            seen = None
+            while True:
+                time.sleep(every_s)
+                n = self.totals["requests"]
+                if n == seen or not hasattr(self.engine, "experts") or getattr(self.engine, "batch", 0) \
+                        or not self.loaded() or not self.fifo.acquire(blocking=False):
+                    continue
+                try:
+                    v = self.engine.experts()
+                except Exception:
+                    v = None
+                finally:
+                    self.fifo.release()
+                if v:
+                    self.experts_view, seen = {**v, "time": time.time()}, n
+        threading.Thread(target=loop, name="experts", daemon=True).start()
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3101,6 +3146,7 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "tuning": tuning_rows(),
+                "experts": self.experts_view,
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -5750,6 +5796,8 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    if a.engine == "strata":
+        svc.watch_experts()
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
     try:

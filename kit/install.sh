@@ -167,7 +167,7 @@ best=0; BEST_ARGS=(--spec 3); BEST_ENV=""
 try() {   # try "<label>" "<env>" <args...>
   local label=$1 envs=$2; shift 2
   local r; r=$(bench "$envs" "$@"); r=${r:-0}
-  say "  $label: $r tok/s"
+  say "  $label: $r tok/s   (${*:-} ${envs:-})"
   echo "$label,$r" >> $DEST/tune.csv
   if awk "BEGIN{exit !($r > $best)}"; then best=$r; BEST_ARGS=("$@"); BEST_ENV=$envs; fi
 }
@@ -175,25 +175,25 @@ say "measuring settings (one engine start per line, ~40 s each, 180 s at most)"
 : > $DEST/tune.csv; : > $DEST/tune.log
 for k in 2 3 4; do try "draft length $k" "" --spec $k; done
 K=("${BEST_ARGS[@]}")
-for r in 450 250; do try "${K[*]}, vram reserve $r MiB" "" "${K[@]}" --vram-reserve-mib $r; done
+for r in 450 250; do try "vram reserve $r MiB" "" "${K[@]}" --vram-reserve-mib $r; done
 B=("${BEST_ARGS[@]}")
 # the share of cache misses read over PCIe instead of computed on the CPU (default: the engine's link-based guess;
 # a desktop 2070 SUPER on PCIe 3.0 with a 2-core CPU decoded 79 tok/s at 1 against 59 at the guess)
-for f in 0.66 1; do try "${B[*]}, PCIe share $f" "" "${B[@]}" --pcie-frac $f; done
+for f in 0.66 1; do try "PCIe share $f" "" "${B[@]}" --pcie-frac $f; done
 B=("${BEST_ARGS[@]}")
 # the GPU prefetch of the next layer's predicted misses: on by default with up to 3 a layer (it shares the link with
 # the window's own copies and competes with the CPU's experts for RAM), and the copy kernel's blocks (default 4)
-try "${B[*]}, no GPU prefetch" "STRATA_PREFETCH=0" "${B[@]}"
-for p in 2 5; do try "${B[*]}, GPU prefetch up to $p a layer" "STRATA_PREFETCH_MAX=$p" "${B[@]}"; done
+try "no GPU prefetch" "STRATA_PREFETCH=0" "${B[@]}"
+for p in 2 5; do try "GPU prefetch up to $p a layer" "STRATA_PREFETCH_MAX=$p" "${B[@]}"; done
 B=("${BEST_ARGS[@]}"); E=$BEST_ENV
-try "${B[*]} $E, 8 copy blocks" "$E STRATA_FETCH_FORK=8" "${B[@]}"
+try "8 copy blocks" "$E STRATA_FETCH_FORK=8" "${B[@]}"
 B=("${BEST_ARGS[@]}"); E=$BEST_ENV
-for w in 5 4; do try "${B[*]} $E, $w pool workers" "$E" "${B[@]}" --pool-workers $w; done
+for w in 5 4; do try "$w pool workers" "$E" "${B[@]}" --pool-workers $w; done
 B=("${BEST_ARGS[@]}"); E=$BEST_ENV
-for e in 6 7; do try "${B[*]} $E, expert layout $e" "$E STRATA_EXP_MODE=$e" "${B[@]}"; done
-say "best: ${BEST_ARGS[*]} ${BEST_ENV} -> $best tok/s"
+for e in 6 7; do try "expert layout $e" "$E STRATA_EXP_MODE=$e" "${B[@]}"; done
+say "best: $(echo ${BEST_ARGS[*]} $BEST_ENV) -> $best tok/s"
 [ "$best" != 0 ] || { tail -5 $DEST/tune.log; die "the engine did not start (above; the whole log: $DEST/tune.log)"; }
-echo "best,${BEST_ARGS[*]} ${BEST_ENV},$best" >> $DEST/tune.csv
+echo "best,$(echo ${BEST_ARGS[*]} $BEST_ENV),$best" >> $DEST/tune.csv
 
 # ---- config and service
 $DEST/venv/bin/python - "$DEST" "$HOST" "$API_KEY" "$BEST_ENV" "${BASE[@]}" "${BEST_ARGS[@]}" <<'EOF'

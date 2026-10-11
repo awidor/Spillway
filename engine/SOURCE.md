@@ -27,6 +27,7 @@ Not a fork: nothing here goes upstream.
 | Removed: upstream's docs and benchmark results, data for other models (other expert profiles and draft vocabularies, the Qwen3.8 control vector) | `docs/`, `bench/`, `data/` |
 | The web page is Spillway's dashboard (`/metrics` as charts) instead of the chat app; `/metrics` adds the installer's tuning runs (`tuning_rows`, `tune.csv`) | `serve/web/`, `serve/server.py`, `serve/test_tuning.py` |
 | `chat.py`: port 8095, `--api-key` | `chat.py` |
+| `EXPERTS` between requests: each (layer, expert)'s VRAM residency and decayed routing count, for the dashboard's heatmap (the server asks while idle: `watch_experts`, `/metrics` "experts") | `src/program/generate.cpp`, `serve/server.py` |
 | Line endings normalized to LF | all text files |
 
 Measurements for each change: `../docs/BENCHMARKS.md`.

@@ -1,62 +1,58 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Spillway</title>
-<link rel="stylesheet" href="web/tokens.css">
-<link rel="stylesheet" href="web/components.css">
 <link rel="stylesheet" href="web/app.css">
-<script>
-  try {
-    const t = localStorage.getItem("strata.theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-    document.documentElement.dataset.theme = t;
-  } catch (e) {}
-</script>
 </head>
 <body>
-<header class="st-header">
-  <span class="st-header__brand">Spillway</span>
-  <span class="st-header__spacer"></span>
-  <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
-    <span class="st-pill__dot"></span><span id="pill-text">&hellip;</span></span>
-  <button class="st-btn st-btn--icon" id="theme-btn" aria-label="Light / dark">
-    <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
+<header class="top">
+  <h1>Spillway</h1>
+  <p class="state" id="state" role="status" aria-live="polite">Connecting</p>
 </header>
 
-<main class="dash">
-  <div class="tiles" id="tiles"></div>
+<main>
+  <section class="heat" aria-labelledby="h-heat">
+    <div class="heat__head">
+      <h2 id="h-heat">Experts</h2>
+      <p class="heat__count" id="heat-count"></p>
+    </div>
+    <div class="heat__frame">
+      <div class="heat__rows" aria-hidden="true"><span>layer 1</span><span>40</span></div>
+      <canvas id="heat" role="img" aria-label="40 layers by 256 experts: in VRAM or in RAM, and how often each is routed"></canvas>
+      <div class="tip" id="tip" hidden></div>
+    </div>
+    <div class="heat__keys" aria-hidden="true">
+      <span class="ramp ramp--vram"></span>in VRAM
+      <span class="ramp ramp--ram"></span>in RAM
+      <span class="heat__note">each layer sorted by routing, most used left</span>
+    </div>
+  </section>
 
-  <div class="row row--2-1">
-    <figure class="st-card panel">
-      <figcaption>Experts per request <span class="legend" id="lg-src"></span></figcaption>
-      <svg id="ch-src" viewBox="0 0 600 200" preserveAspectRatio="none" role="img" aria-label="Expert sources per request"></svg>
-    </figure>
-    <figure class="st-card panel">
-      <figcaption>VRAM <span class="legend" id="lg-vram"></span></figcaption>
-      <svg id="ch-vram" viewBox="0 0 300 200" role="img" aria-label="GPU memory"></svg>
-    </figure>
-  </div>
+  <section class="readouts" id="readouts" aria-label="Now"></section>
 
-  <div class="row row--3">
-    <figure class="st-card panel"><figcaption>tok/s × context</figcaption>
-      <svg id="ch-ctx" viewBox="0 0 320 200" role="img" aria-label="Decode speed by context"></svg></figure>
-    <figure class="st-card panel"><figcaption>tok/s × VRAM share</figcaption>
-      <svg id="ch-hit" viewBox="0 0 320 200" role="img" aria-label="Decode speed by VRAM share"></svg></figure>
-    <figure class="st-card panel"><figcaption>tok/s × drafts accepted</figcaption>
-      <svg id="ch-draft" viewBox="0 0 320 200" role="img" aria-label="Decode speed by draft acceptance"></svg></figure>
-  </div>
-
-  <div class="row row--2">
-    <figure class="st-card panel">
-      <figcaption>Last 60 s <span class="legend" id="lg-live"></span></figcaption>
-      <svg id="ch-live" viewBox="0 0 600 200" preserveAspectRatio="none" role="img" aria-label="Last minute"></svg>
+  <section class="charts">
+    <figure class="chart chart--wide">
+      <figcaption>Where each request's experts ran <span class="keys" id="k-src"></span></figcaption>
+      <svg id="c-src" viewBox="0 0 640 220" role="img" aria-label="Expert sources and decode speed per request"></svg>
     </figure>
-    <figure class="st-card panel">
-      <figcaption>Tuning</figcaption>
-      <div class="bars" id="ch-tune"></div>
+    <figure class="chart">
+      <figcaption>VRAM</figcaption>
+      <div class="split" id="c-vram"></div>
+      <h3 class="sub">Tuning on this machine</h3>
+      <div class="tune" id="c-tune"></div>
     </figure>
-  </div>
+    <figure class="chart chart--wide">
+      <figcaption>Last 60 seconds <span class="keys" id="k-live"></span></figcaption>
+      <svg id="c-live" viewBox="0 0 640 220" preserveAspectRatio="none" role="img" aria-label="Decode speed, GPU, CPU and PCIe over the last minute"></svg>
+    </figure>
+    <figure class="chart">
+      <figcaption>Decode speed by context</figcaption>
+      <svg id="c-ctx" viewBox="0 0 400 220" role="img" aria-label="Decode tokens per second by context length"></svg>
+    </figure>
+  </section>
 </main>
 <script src="web/app.js"></script>
 </body>

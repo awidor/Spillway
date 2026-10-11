@@ -12,9 +12,10 @@ All measurements: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
   service then ran slower than the settings were tuned for.
 - The installer stops with the engine's error when no setting starts; before, it installed a service that could not
   run.
-- The page at `http://127.0.0.1:8095/` is a dashboard. It shows, per request, where the experts came from (VRAM, PCIe,
-  CPU) next to tok/s, VRAM and expert-cache use, and tok/s against context, against VRAM share and against draft
-  acceptance. It also has the last minute of GPU, CPU and PCIe use, and the installer's tuning runs.
+- The page at `http://127.0.0.1:8095/` is a dashboard. It has a heatmap of all 10,240 experts (40 layers x 256),
+  showing which are in VRAM and how often each is routed, read from the engine's new `EXPERTS` command. It also shows,
+  per request, where the experts ran (VRAM, PCIe, CPU) next to decode speed, plus the VRAM split, decode speed by
+  context, the last minute of GPU, CPU and PCIe use, and the installer's tuning runs.
 - Release asset: `spillway-linux-x86_64.tar.gz` with a `.sha256`. The service is `spillway.service` in `/opt/spillway`.
   An install of v0.4.0 or older (/opt/strata) is replaced.
 - Builds target only sm_75 (the RTX 2070 Max-Q).
