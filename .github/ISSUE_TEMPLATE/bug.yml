@@ -1,0 +1,23 @@
+name: Bug
+description: Something does not work on the laptop
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: spillway report
+      description: The output of `spillway report` (or the installer's last 40 lines, if it did not finish)
+      render: markdown
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log
+      description: "`journalctl -u spillway -n 100`"
+      render: text

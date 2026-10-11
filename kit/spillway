@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# spillway: manage the installed service (/opt/spillway, spillway.service).
+#   spillway status      is it running, the API's health, the tuned settings
+#   spillway logs        follow the service's log
+#   spillway chat        chat in the terminal
+#   spillway retune      measure the settings again (the service stops while it runs)
+#   spillway report      this machine and its results as Markdown, for an issue
+#   spillway update      install the latest release (SPILLWAY_VERSION=v0.5.0 for one version)
+#   spillway uninstall   remove Spillway (the model file is kept)
+set -eu
+D=/opt/spillway
+PORT=8095 API_KEY=
+[ -r $D/settings.env ] && . $D/settings.env
+API=http://127.0.0.1:$PORT
+AUTH=(); [ -n "$API_KEY" ] && AUTH=(-H "Authorization: Bearer $API_KEY")
+best() { grep '^best,' $D/tune.csv 2>/dev/null | cut -d, -f2- | sed 's/,/ -> /; s/$/ tok\/s/'; }
+
+case "${1:-}" in
+  status)
+    echo "service: $(systemctl is-active spillway.service || true)"
+    echo "api:     $(curl -s -m 3 "${AUTH[@]}" $API/health 2>/dev/null || echo unreachable) ($API)"
+    echo "version: $(head -1 $D/VERSIONS)"
+    echo "tuned:   $(best)" ;;
+  logs) exec journalctl -u spillway.service -f ;;
+  chat) exec $D/venv/bin/python $D/chat.py --port "$PORT" ${API_KEY:+--api-key "$API_KEY"} "${@:2}" ;;
+  retune) exec bash $D/install.sh --retune ;;
+  update) curl -fsSL https://github.com/awidor/Spillway/releases/latest/download/install.sh | bash ;;
+  uninstall) exec bash $D/install.sh --uninstall ;;
+  report)
+    t=$(curl -s -m 3 "${AUTH[@]}" $API/v1/status 2>/dev/null | $D/venv/bin/python -c 'import json,sys
+t = json.load(sys.stdin)["last_timings"]
+print("decode %.1f tok/s, prompt %.1f tok/s, %s prompt tokens" % (t["predicted_per_second"], t["prompt_per_second"], t.get("prompt_n")))' 2>/dev/null || echo "no request yet")
+    cat <<EOF
+| | |
+|---|---|
+| Spillway | $(head -1 $D/VERSIONS) |
+| GPU | $(nvidia-smi --query-gpu=name,driver_version,memory.total,pcie.link.gen.max --format=csv,noheader | head -1) |
+| CPU | $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs), $(nproc) threads |
+| RAM | $(awk '/MemTotal/ {printf "%.1f GiB", $2 / 1048576}' /proc/meminfo) |
+| OS | $(. /etc/os-release && echo "$PRETTY_NAME"), kernel $(uname -r) |
+| Tuned | $(best) |
+| Last request | $t |
+
+<details><summary>tune.csv</summary>
+
+\`\`\`
+$(cat $D/tune.csv 2>/dev/null)
+\`\`\`
+</details>
+EOF
+    ;;
+  boost)   # run by the service as root before every start: the settings the tuning measured with
+    for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -e "$g" ] && echo performance > "$g"; done
+    nvidia-smi -pm 1 >/dev/null 2>&1 || true ;;
+  *) sed -n 2,9p "$0"; [ -z "${1:-}" ] || [ "$1" = help ] || [ "$1" = -h ] || exit 1 ;;
+esac

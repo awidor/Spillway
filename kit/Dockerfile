@@ -1,6 +1,6 @@
-# Build image for every Linux binary that goes to the box (PLAN.md phase 0).
-# Ubuntu 20.04 base: glibc 2.31, so the binaries run on any distro the box may have.
-# CUDA 12.8: runs on any 525+ driver; sm_75 for the box, sm_86 for the dev PC's 3080.
+# Build image for every Linux binary that goes to the laptop (docs/design/plan.md, phase 0).
+# Ubuntu 20.04 base: glibc 2.31, so the binaries run on any distro the laptop may have.
+# CUDA 12.8: runs on any 525+ driver; sm_75: the laptop's RTX 2070 Max-Q (Turing), the only target.
 FROM nvidia/cuda:12.8.1-devel-ubuntu20.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

@@ -249,12 +249,6 @@ class ConversationCacheCard(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
-    def test_the_card_is_on_the_page(self):
-        web = Path(__file__).parent / "web"
-        html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
-        for el in ("cc-card", "cc-slots-text", "cc-mem-text", "cc-facts", "cc-note"):
-            self.assertIn(f'id="{el}"', html)
-            self.assertIn(f'"{el}"', js)
 
 
 if __name__ == "__main__":

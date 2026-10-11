@@ -3100,6 +3100,7 @@ class Service:
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+                "tuning": tuning_rows(),
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -3791,6 +3792,19 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
+
+
+def tuning_rows(path: Path = ROOT / "tune.csv") -> dict | None:
+    """Spillway: what the installer measured on this machine (tune.csv: "<setting>,<tok/s>" rows, then
+    "best,<settings>,<tok/s>"), for the Engine view.  None when there is no file (a run outside the installer)."""
+    try:
+        rows = [line.rsplit(",", 1) for line in path.read_text(encoding="utf-8").splitlines() if "," in line]
+    except OSError:
+        return None
+    num = lambda v: float(v) if v.replace(".", "", 1).isdigit() else 0.0
+    runs = [{"label": k, "tok_s": num(v)} for k, v in rows if not k.startswith("best,")]
+    best = next(({"settings": k[5:].strip(), "tok_s": num(v)} for k, v in rows if k.startswith("best,")), None)
+    return {"runs": runs, "best": best}
 
 
 def request_stats(segments: list[dict]) -> dict:

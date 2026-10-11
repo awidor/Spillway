@@ -3544,7 +3544,7 @@ int exp_mode() {
 #else
     // Spillway: mode 8 (the grid and the group's activations in shared memory, SwiGLU + q8_1 fused) on every card.
     // Qwen3.6 3.06 bpw on the RTX 3080 proxy: VRAM-hit experts 5.1 -> 1.7 ms/window, decode 73 -> 114 tok/s,
-    // greedy output identical over 128 tokens (RESULTS.md). STRATA_EXP_MODE still overrides it for A/B.
+    // greedy output identical over 128 tokens (docs/BENCHMARKS.md). STRATA_EXP_MODE still overrides it for A/B.
     return 8;
 #endif
 }

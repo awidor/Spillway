@@ -1,0 +1,20 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  server-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r kit/requirements.txt pillow
+      - run: cd engine && python -m unittest discover -s serve -p "test_*.py" -t .
+  scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: for f in dev.sh kit/install.sh kit/spillway kit/*.sh dev/*.sh dev/scout/*.sh; do bash -n "$f" || exit 1; done

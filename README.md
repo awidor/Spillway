@@ -1,75 +1,96 @@
 # Spillway
 
-[Strata](https://github.com/Niko1221/Strata)'s hybrid GPU + CPU mixture-of-experts engine, cut down and tuned for one
-model on one machine:
+Qwen3.6-35B-A3B with 128K context on an RTX 2070 Max-Q laptop: 8 GB VRAM, 16 GB RAM, Linux. It serves an OpenAI-compatible
+API and a live dashboard.
 
-- **Model:** Qwen3.6-35B-A3B, byteshape's 3.06 bpw GGUF with its MTP draft layer
-  ([byteshape/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/byteshape/Qwen3.6-35B-A3B-MTP-GGUF)), used as published.
-- **Box:** a headless Linux machine with an RTX 2070 Max-Q (8 GB, Turing), an i7-9750H (6 cores), 16 GB of DDR4 and
-  PCIe 3.0.
-- **Context:** at least 128K tokens.
+The 13.6 GB model doesn't fit in 8 GB of VRAM. Spillway keeps the most-used experts in VRAM. The rest stay in pinned RAM,
+where the CPU computes them or the GPU copies them over PCIe, with a prefetch one layer ahead. The model's own MTP layer
+drafts the next tokens. The engine is a trimmed copy of [Strata](https://github.com/Niko1221/Strata), tuned for this one
+machine.
 
-The 13.6 GB model does not fit in 8 GB of VRAM. The engine keeps every expert in pinned RAM and the most used ones in a
-VRAM cache, computes the misses on the CPU in place (or copies them over PCIe), and drafts with the model's own MTP
-layer.
+## Speed
 
-## Status
+| Machine | Spillway | llama.cpp `--moe-cache-mib` | llama.cpp `--n-cpu-moe` |
+|---|---:|---:|---:|
+| RTX 2070 Max-Q laptop, short requests (v0.1.0) | 69-76 tok/s | | |
+| RTX 2070 SUPER test server, 6K / 30K prompt (v0.4.0) | 81 / 74 tok/s | | |
+| RTX 3080 test PC, short requests | 143-167 tok/s | 73-89 tok/s | 33-37 tok/s |
 
-On the box (first report): 69-76 tok/s output on short requests, 2-3.6x the Gemma service it replaces. The rest was
-measured on a stand-in (RTX 3080 10 GB in WSL2, Ryzen 7 5700X):
+Every measurement and how it was taken: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-| On the stand-in, 3.06 bpw file | Decode tok/s |
-|---|---:|
-| llama.cpp, `--n-cpu-moe` | 33-37 |
-| llama.cpp, `--moe-cache-mib` | 73-89 |
-| Spillway, MTP off | 93-114 |
-| **Spillway, MTP on (draft length 3)** | **143-167** |
-| Spillway at the box's budget (VRAM held to 7.8 GB free, Turing code paths, 6 cores), MTP on | 143 |
+## Requirements
 
-Every number, with how it was measured: [RESULTS.md](RESULTS.md). The plan, the hardware facts behind each choice and
-the speed projections: [PLAN.md](PLAN.md). What changed against upstream: [engine/SOURCE.md](engine/SOURCE.md).
-
-## Layout
-
-| Path | What |
+| | |
 |---|---|
-| `engine/` | the engine: a copy of Strata `650cf81` (MIT) with the changes listed in `engine/SOURCE.md` |
-| `kit/` | the build image and the scripts that go to the box: `s1.sh` (scouting / llama.cpp baseline), `s2.sh` (install, tune, run) |
-| `perfmodel/` | the speed model, the hardware probe, and the dev-PC benchmark and parity scripts |
-| `PLAN.md`, `RESULTS.md` | the plan and the measurements |
+| GPU | RTX 2070 Max-Q (Turing, 8 GB); NVIDIA driver 525 or newer |
+| RAM | 16 GB |
+| OS | Linux x86_64 with systemd (not WSL), Python 3.10+ |
+| Disk | 14 GB for the model, 1 GB for Spillway |
 
-## Build
+The installer refuses any GPU that isn't a Turing card with 8 GB. The build targets only sm_75.
 
-Everything is built in a container (Ubuntu 20.04, CUDA 12.8, sm_75 + sm_86), so the binaries need only glibc 2.31+
-and an NVIDIA driver 525+ on the box. From the repository root:
-
-```bash
-docker build -t strata-build kit
-git clone https://github.com/ggml-org/llama.cpp engine/third_party/llama.cpp
-git -C engine/third_party/llama.cpp checkout 3cf03257f219afbe7334045ff7c6a06ac68c627d
-docker run --rm -v "$PWD:/src" -v strata-work:/work strata-build bash /src/kit/build.sh
-docker run --rm -v "$PWD:/src" -v strata-work:/work strata-build bash /src/kit/build_engine.sh
-docker run --rm -v "$PWD:/src" strata-build bash /src/kit/package_s2.sh
-```
-
-That gives `out/s1kit/` (llama.cpp's `llama-batched-bench` plus the `scout` micro-benchmarks) and `out/s2kit/` (the
-engine, the server and the installer). The llama.cpp checkout provides `gguf-py` for the packer.
-
-## Run on the box
-
-Copy `out/s2kit/` to the box and run:
+## Install
 
 ```bash
-bash s2kit/s2.sh
+curl -fsSL https://github.com/awidor/Spillway/releases/latest/download/install.sh | bash
 ```
 
-It downloads the model if it is not next to the kit, installs to `/opt/strata`, packs the model, tries nine settings
-(draft length, VRAM reserve, CPU workers, expert kernel layout), starts `strata.service` with an OpenAI-compatible
-API on `127.0.0.1:8095` and checks it. `bash s2kit/s2.sh --undo` removes it again.
+The installer:
+- checks the machine and downloads the model, or reuses it from the Hugging Face cache or `--model PATH`
+- installs to `/opt/spillway` and adds the `spillway` command
+- measures about 15 settings on the machine, then keeps the fastest
+- starts `spillway.service` on `127.0.0.1:8095`, then checks a short request and a ~117K-token one
 
-For llama.cpp's numbers on the same box, copy `out/s1kit/` and run `bash s1kit/s1.sh`.
+It sets the CPU governor to `performance` and turns on GPU persistence mode each time the service starts. `spillway uninstall`
+puts both back.
+
+| Option | |
+|---|---|
+| `--model PATH` | use this GGUF (byteshape's `Qwen3.6-35B-A3B-IQ3_S-3.06bpw.gguf`) |
+| `--port N` | listen on port N (default 8095) |
+| `--lan` | listen on the network, with a generated API key |
+| `--local` | back to this machine only |
+
+To pass options to the one-liner: `curl -fsSL .../install.sh | bash -s -- --lan`.
+
+## Use
+
+| | |
+|---|---|
+| Dashboard | `http://127.0.0.1:8095/` |
+| OpenAI API | `http://127.0.0.1:8095/v1`, model `qwen3.6-35b-a3b` |
+| Anthropic API | `http://127.0.0.1:8095/v1/messages` |
+| Terminal chat | `spillway chat` |
+
+```bash
+curl http://127.0.0.1:8095/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3.6-35b-a3b", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+With `--lan`, send the key as `Authorization: Bearer <key>`. The dashboard takes it as `http://<host>:8095/#key=<key>`.
+The installer prints both.
+
+## Manage
+
+| Command | |
+|---|---|
+| `spillway status` | service, API health, version, tuned settings |
+| `spillway logs` | follow the service log |
+| `spillway retune` | measure the settings again |
+| `spillway report` | machine and results as Markdown, for an issue |
+| `spillway update` | install the latest release |
+| `spillway uninstall` | remove everything except the model |
+
+## Build from source
+
+```bash
+./dev.sh setup && ./dev.sh build && ./dev.sh package
+```
+
+This needs Docker. The result is in `out/release/`. Tests, benchmarks and the repo layout: [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
 ## License
 
-MIT. `engine/` is Strata's code under its own MIT notice (`engine/LICENSE`), with the changes listed in
-`engine/SOURCE.md`; the rest is under `LICENSE`.
+MIT (`LICENSE`). `engine/` is Strata's code under its own MIT notice (`engine/LICENSE`), changed as listed in
+[engine/SOURCE.md](engine/SOURCE.md). The model is byteshape's
+[Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/byteshape/Qwen3.6-35B-A3B-MTP-GGUF), used as published.

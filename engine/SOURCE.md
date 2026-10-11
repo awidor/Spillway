@@ -3,7 +3,7 @@
 A copy of [Strata](https://github.com/Niko1221/Strata) (MIT, see `LICENSE`) at `650cf81`, the head of
 [#1820](https://github.com/Niko1221/Strata/pull/1820), which contains upstream `main` @ `fb58e0d` and
 [#1402](https://github.com/Niko1221/Strata/pull/1402) @ `48534f3` (the Qwen3.6 / `qwen35moe` port). Copied 10 Oct 2026.
-Not a fork: nothing here goes upstream. `README.md` and `docs/` are upstream's and describe upstream.
+Not a fork: nothing here goes upstream. 
 
 ## Changes against 650cf81
 
@@ -24,6 +24,9 @@ Not a fork: nothing here goes upstream. `README.md` and `docs/` are upstream's a
 | The fast router top-k on CUDA too (bitwise; `cuda_router_fast` runs the HIP test through a name shim; `STRATA_ROUTER_OLD=1`) | `src/kernels/cuda/router_top10.cu`, `CMakeLists.txt`, `tests/cuda_shim/` |
 | i-quant dense MMVQ reads the activations from shared memory, 2 rows a warp (bitwise; `STRATA_IQ_MMVQ_LDS=0`) | `src/kernels/cuda/iq_kernels.cu` |
 | Removed: SYCL engine, installer (`setup.py` and its tests), MCP server tool, Docker files, Windows launchers, translated READMEs | |
+| Removed: upstream's docs and benchmark results, data for other models (other expert profiles and draft vocabularies, the Qwen3.8 control vector) | `docs/`, `bench/`, `data/` |
+| The web page is Spillway's dashboard (`/metrics` as charts) instead of the chat app; `/metrics` adds the installer's tuning runs (`tuning_rows`, `tune.csv`) | `serve/web/`, `serve/server.py`, `serve/test_tuning.py` |
+| `chat.py`: port 8095, `--api-key` | `chat.py` |
 | Line endings normalized to LF | all text files |
 
-Measurements for each change: `../RESULTS.md`.
+Measurements for each change: `../docs/BENCHMARKS.md`.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""A tiny terminal chat for a running Strata server (start it with run-<model>.bat / run-<model>.sh first).
+"""A tiny terminal chat for the running Spillway service (`spillway chat` starts it with the installed settings).
 
-    python chat.py [--port 8080] [--think none|low|medium|high]
+    python chat.py [--port 8095] [--api-key KEY] [--think none|low|medium|high]
 
 Type a message and press Enter.  /image <path> attaches a picture to your next message (when the server was set up
 with images), /think <none|low|medium|high> sets how long the model thinks first, /reset starts a new conversation,
@@ -19,10 +19,10 @@ import time
 import urllib.request
 
 
-def stream(url, messages, think, max_tokens):
+def stream(url, messages, think, max_tokens, key=""):
     body = {"model": "strata", "messages": messages, "stream": True, "max_tokens": max_tokens,
             "reasoning_effort": think}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", **({"Authorization": "Bearer " + key} if key else {})})
     with urllib.request.urlopen(req, timeout=3600) as r:
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
@@ -34,7 +34,8 @@ def stream(url, messages, think, max_tokens):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--port", type=int, default=8095)
+    ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""), help="the key, when the service has one")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--think", default="medium", choices=["none", "low", "medium", "high"],
                     help="how long the model thinks before answering (none = answer directly)")
@@ -45,7 +46,7 @@ def main() -> int:
     gray, reset = ("\033[90m", "\033[0m") if sys.stdout.isatty() else ("", "")
     messages, pending = [], []
     think = "none" if a.no_think else a.think
-    print(f"Strata chat ({url}).  /image <path> = attach a picture, /think none|low|medium|high (now: {think}), "
+    print(f"Spillway chat ({url}).  /image <path> = attach a picture, /think none|low|medium|high (now: {think}), "
           f"/reset = new conversation, /quit = leave.")
     while True:
         try:
@@ -88,7 +89,7 @@ def main() -> int:
         print("model> ", end="", flush=True)
         try:
             in_think = False
-            for reasoning, content in stream(url, messages, think, a.max_tokens):
+            for reasoning, content in stream(url, messages, think, a.max_tokens, a.api_key):
                 if reasoning:
                     if not in_think:
                         print(gray, end="")

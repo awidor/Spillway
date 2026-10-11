@@ -1867,7 +1867,7 @@ bool launch_mq(const float* q, const QsaAttnPools& pools, const int32_t* steps, 
 }
 // Default: 4 positions per block with q and p as single FP16 halves, the precision of llama.cpp's flash attention
 // (RTX 2070 SUPER, 30K x 2,048 positions: 63 ms; v1 213). Next-token KL against the hi + lo arithmetic: 1e-4 to 5e-4,
-// a quarter to a tenth of what the int8 K/V cache itself moves (RESULTS.md).
+// a quarter to a tenth of what the int8 K/V cache itself moves (docs/BENCHMARKS.md).
 // STRATA_PROMPT_MQ: 0 off (v1 / v2); 2, 4 or 8 positions per block with hi + lo halves (FP32-level, bit for bit
 // v1's output; 2 is the fastest of them on Turing: 109 ms), "f" appended for single halves.
 bool dense_mq(const float* q, const QsaAttnPools& pools, const int32_t* steps, const QsaShapes& s, float* attn,
