@@ -2,6 +2,11 @@
 
 All measurements: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
+## v0.5.2
+
+- The service listens on the network by default, without an API key. `--lan` still works and is now the default,
+  `--local` keeps it to the laptop, and `--api-key KEY` requires a key. An existing install keeps its saved setting.
+
 ## v0.5.1
 
 - Dashboard: a token trace next to the expert heatmap. It shows the 8 experts each layer picked for the token being

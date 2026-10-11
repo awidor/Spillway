@@ -16,12 +16,12 @@ curl -fsSL https://github.com/awidor/Spillway/releases/latest/download/install.s
 ```
 
 It downloads the model if you don't have it yet, tries a handful of settings to find the fastest, and starts a service
-on port 8095. If you want to reach it from other machines, end the command with `bash -s -- --lan` instead and it'll
-set up an API key for you.
+on port 8095 that the rest of your network can reach. To keep it to the laptop itself, end the command with
+`bash -s -- --local` instead, or add `--api-key <key>` if you want clients to need a key.
 
 ## Use
 
-Open http://127.0.0.1:8095 for the dashboard. Point any OpenAI client at `http://127.0.0.1:8095/v1` with the model
+Open http://<laptop>:8095 for the dashboard. Point any OpenAI client at `http://<laptop>:8095/v1` with the model
 `qwen3.6-35b-a3b`, or run `spillway chat` in a terminal.
 
 `spillway status`, `spillway update` and `spillway uninstall` do what they say. `spillway help` lists the rest.

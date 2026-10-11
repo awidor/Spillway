@@ -3,8 +3,8 @@
 # OpenAI-compatible API. Installs the engine, packs the model, measures the settings only this machine can decide,
 # starts spillway.service and checks it through the API.
 #   curl -fsSL https://github.com/awidor/Spillway/releases/latest/download/install.sh | bash
-#   bash install.sh [--model PATH] [--port N] [--lan | --local]   install or update, tune, start (asks for sudo once)
-#                                     --lan: listen on the network, with an API key; --local: this machine only
+#   bash install.sh [--model PATH] [--port N] [--lan | --local] [--api-key KEY]   install or update, tune, start
+#                      --lan (the default): listen on the network; --local: this machine only; --api-key: require a key
 #   bash install.sh --retune                              measure the settings again with the installed files
 #   bash install.sh --uninstall                           remove the service and /opt/spillway (the model is kept)
 # Run outside an unpacked release, it downloads the release (SPILLWAY_VERSION=v0.5.0 for one version) and runs that.
@@ -37,7 +37,7 @@ fi
 
 MODE=install MODEL= ARG_MODEL=
 [ -f $DEST/settings.env ] && . $DEST/settings.env   # PORT, HOST, API_KEY, MODEL of the installed copy
-PORT=${PORT:-8095} HOST=${HOST:-127.0.0.1} API_KEY=${API_KEY:-}
+PORT=${PORT:-8095} HOST=${HOST:-0.0.0.0} API_KEY=${API_KEY:-}
 while [ $# -gt 0 ]; do
   case $1 in
     --retune) MODE=retune ;;
@@ -46,6 +46,7 @@ while [ $# -gt 0 ]; do
     --port) PORT=$2; shift ;;
     --lan) HOST=0.0.0.0 ;;
     --local) HOST=127.0.0.1 ;;
+    --api-key) API_KEY=$2; shift ;;
     -h|--help) sed -n 2,10p "$KIT/install.sh"; exit 0 ;;
     *) die "unknown option $1 (--help lists them)" ;;
   esac
@@ -137,7 +138,6 @@ else
   [ -x $DEST/bin/strata ] || die "not installed: run install.sh first"
   sudo systemctl stop spillway.service
 fi
-if [ $HOST != 127.0.0.1 ] && [ -z "$API_KEY" ]; then API_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))'); fi
 printf 'PORT=%s\nHOST=%s\nAPI_KEY=%s\nMODEL=%s\n' "$PORT" "$HOST" "$API_KEY" "$M" > $DEST/settings.env
 chmod 600 $DEST/settings.env
 
