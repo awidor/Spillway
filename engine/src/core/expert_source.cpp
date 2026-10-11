@@ -3260,6 +3260,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++groups;
         }
         P.start[groups] = entries;
+        if (!d.route.empty() && (size_t) (d.layers + 1) * (size_t) k * 3 <= d.route.size()) {   // Spillway: the trace
+            static const char hx[] = "0123456789abcdef";
+            char* r = &d.route[(size_t) d.layers * (size_t) k * 3];
+            for (int64_t j = 0; j < k && j < n; ++j, r += 3) {
+                const int32_t e = ids[j];
+                r[0] = hx[(e >> 4) & 15];
+                r[1] = hx[e & 15];
+                r[2] = kind[j] == 0 ? 'v' : kind[j] == 1 ? (prefetched(e) ? 'p' : 'c') : 'u';
+            }
+        }
         const uint64_t bb = lay.blob_bytes(d.layers);
         if (npf > 0) {   // the prefetched ones first: the GPU moves that leading run into its hits' launch (pf_merge)
             int w = 0;

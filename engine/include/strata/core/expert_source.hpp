@@ -423,6 +423,10 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// Spillway: the dashboard's token trace.  Per layer, the window's first token's k routed experts and where each
+    /// ran, 3 chars an entry: 2 hex digits of the expert, then 'v' VRAM, 'p' prefetched over PCIe, 'c' copied over PCIe
+    /// on demand, 'u' CPU.  Sized by the caller to layers * k * 3 (empty = off).
+    std::string route;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).

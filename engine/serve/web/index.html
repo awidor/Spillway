@@ -14,6 +14,7 @@
 </header>
 
 <main>
+  <div class="lead">
   <section class="heat" aria-labelledby="h-heat">
     <div class="heat__head">
       <h2 id="h-heat">Experts</h2>
@@ -30,6 +31,24 @@
       <span class="heat__note">expert 0 to 255, left to right</span>
     </div>
   </section>
+
+  <section class="trace" aria-labelledby="h-trace">
+    <div class="heat__head">
+      <h2 id="h-trace">Token route</h2>
+      <p class="heat__count" id="trace-count"></p>
+    </div>
+    <div class="trace__body">
+      <svg id="c-route" role="img" aria-label="The 8 experts each layer picked for the latest token, and where each ran"></svg>
+      <svg id="c-misses" preserveAspectRatio="none" role="img" aria-label="Picks outside VRAM per layer over the last 20 tokens"></svg>
+    </div>
+    <div class="heat__keys" aria-hidden="true">
+      <span class="dot dot--v"></span>VRAM
+      <span class="dot dot--p"></span>prefetched
+      <span class="dot dot--c"></span>copied
+      <span class="dot dot--u"></span>CPU
+    </div>
+  </section>
+  </div>
 
   <section class="readouts" id="readouts" aria-label="Now"></section>
 

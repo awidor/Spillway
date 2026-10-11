@@ -611,6 +611,7 @@ class StrataEngine:
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
+        self.routes = collections.deque(maxlen=30)   # Spillway: the engine's last ROUTE lines, (time, route)
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
@@ -769,6 +770,9 @@ class StrataEngine:
                     continue
                 except (IndexError, ValueError):
                     pass
+            if line.startswith("ROUTE "):              # Spillway: the token trace, for the dashboard only
+                self.routes.append((time.time(), line[6:].strip()))
+                continue
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
@@ -3147,6 +3151,7 @@ class Service:
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "tuning": tuning_rows(),
                 "experts": self.experts_view,
+                "routes": [{"time": t, "route": r} for t, r in list(getattr(self.engine, "routes", ()))[-20:]],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":

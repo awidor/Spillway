@@ -28,6 +28,7 @@ Not a fork: nothing here goes upstream.
 | The web page is Spillway's dashboard (`/metrics` as charts) instead of the chat app; `/metrics` adds the installer's tuning runs (`tuning_rows`, `tune.csv`) | `serve/web/`, `serve/server.py`, `serve/test_tuning.py` |
 | `chat.py`: port 8095, `--api-key` | `chat.py` |
 | `EXPERTS` between requests: each (layer, expert)'s VRAM residency and decayed routing count, for the dashboard's heatmap (the server asks while idle: `watch_experts`, `/metrics` "experts") | `src/program/generate.cpp`, `serve/server.py` |
+| A token trace for the dashboard: per layer, the window's first token's 8 experts and where each ran (VRAM, prefetched or copied over PCIe, CPU), printed as a `ROUTE` line about 5 times a second while decoding (`ExpertDispatch::route`); the server keeps the last 30 out of the request stream (`/metrics` "routes") | `src/core/expert_source.cpp`, its header, `src/program/generate.cpp`, `serve/server.py`, `serve/web/` |
 | Line endings normalized to LF | all text files |
 
 Measurements for each change: `../docs/BENCHMARKS.md`.

@@ -7788,6 +7788,7 @@ int main(int argc, char** argv) {
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        if (o.serve && g.n_expert <= 256) drive.d.route.assign((size_t) (g.n_layers * g.n_expert_used * 3), '-');
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
         std::vector<double> heat;
@@ -11207,6 +11208,14 @@ int main(int argc, char** argv) {
                     if (sfx_on) sfx.append(outv[(size_t) i]);
                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                }
+                if (!drive.d.route.empty()) {   // Spillway: the window's first token's route, for the dashboard, ~5 a second
+                    static Clock::time_point route_at{};
+                    const Clock::time_point now = Clock::now();
+                    if (now - route_at >= std::chrono::milliseconds(200)) {
+                        route_at = now;
+                        std::printf("ROUTE %s\n", drive.d.route.c_str());
+                    }
                 }
                 std::fflush(stdout);
                 ++rounds;

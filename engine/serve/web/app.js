@@ -26,7 +26,7 @@ function hexColor(c) {
   const v = x.fillStyle;   // "#rrggbb"
   return [1, 3, 5].map((i) => parseInt(v.slice(i, i + 2), 16));
 }
-function drawHeat(ex) {
+function drawHeat(ex, route) {
   const cv = $("heat"), L = ex.layers, E = ex.experts;
   if (!heat || heat.time !== ex.time) {
     const cells = [];
@@ -50,6 +50,16 @@ function drawHeat(ex) {
       g.fillStyle = c.r ? mix(paper, vram, 0.34 + 0.66 * c.h) : mix(paper, cpu, 0.1 + 0.9 * c.h);
       g.fillRect(Math.floor(j * cw), Math.floor(l * ch), Math.ceil(cw), Math.ceil(ch));
     });
+  if (route) {   // the latest token's picks, outlined
+    const K = route.length / 3 / L;
+    g.strokeStyle = css("--ink");
+    g.lineWidth = Math.max(1, 1.25 * dpr);
+    for (let l = 0; l < L; l++)
+      for (let j = 0; j < K; j++) {
+        const e = parseInt(route.substr((l * K + j) * 3, 2), 16);
+        if (e >= 0) g.strokeRect(e * cw - dpr, l * ch - dpr * 0.5, cw + 2 * dpr, ch + dpr);
+      }
+  }
   const n = ex.resident.split("").filter((c) => c === "1").length;
   $("heat-count").innerHTML = `${fmt(n)}<small>of ${fmt(L * E)} in VRAM</small>`;
 }
@@ -65,7 +75,42 @@ $("heat").addEventListener("mousemove", (ev) => {
   tip.textContent = `layer ${l + 1}, expert ${c.e}: ${c.r ? "in VRAM" : "in RAM"}, routing ${fmt(c.h * 100)}%`;
 });
 $("heat").addEventListener("mouseleave", () => { $("tip").hidden = true; });
-addEventListener("resize", () => { if (last && last.experts) drawHeat(last.experts); });
+addEventListener("resize", () => { if (last && last.experts) drawHeat(last.experts, latestRoute(last)); });
+const latestRoute = (m) => ((m.routes || []).at(-1) || {}).route || null;
+
+// ------------------------------------------------------------------ the token trace
+const TIER = {v: "--vram", p: "--pcie", c: "--pcie", u: "--cpu"};
+function drawTrace(routes) {
+  if (!routes.length) {
+    $("trace-count").innerHTML = "<small>appears while the model writes</small>";
+    $("c-route").innerHTML = $("c-misses").innerHTML = "";
+    return;
+  }
+  const r = routes.at(-1).route, L = 40, K = r.length / 3 / L, RH = 10;
+  let s = "", out = 0;
+  for (let l = 0; l < L; l++)
+    for (let j = 0; j < K; j++) {
+      const p = (l * K + j) * 3, t = r[p + 2], x = 6 + j * 12, y = l * RH + RH / 2;
+      if (t !== "v") out++;
+      s += t === "c" ? `<circle cx="${x}" cy="${y}" r="3" fill="none" stroke="var(--pcie)" stroke-width="1.6"/>`
+                     : `<circle cx="${x}" cy="${y}" r="3.4" fill="var(${TIER[t] || "--rule"})"><title>layer ${l + 1}, expert ${parseInt(r.substr(p, 2), 16)}</title></circle>`;
+    }
+  $("c-route").setAttribute("viewBox", `0 0 ${K * 12} ${L * RH}`);
+  $("c-route").innerHTML = s;
+  $("trace-count").innerHTML = `${fmt(out)}<small>of ${fmt(L * K)} outside VRAM</small>`;
+  // the last tokens: per layer, how many of its picks missed VRAM
+  const N = 20, cw = 20;
+  let h = "";
+  routes.slice(-N).forEach((x, i) => {
+    for (let l = 0; l < L; l++) {
+      let miss = 0;
+      for (let j = 0; j < K; j++) if (x.route[(l * K + j) * 3 + 2] !== "v") miss++;
+      h += `<rect x="${i * cw}" y="${l * RH}" width="${cw - 1}" height="${RH - 1}" fill="${miss ? "var(--cpu)" : "var(--faint)"}" fill-opacity="${miss ? 0.2 + 0.8 * Math.min(1, miss / 4) : 1}"><title>layer ${l + 1}: ${miss} of ${K} outside VRAM</title></rect>`;
+    }
+  });
+  $("c-misses").setAttribute("viewBox", `0 0 ${N * cw} ${L * RH}`);
+  $("c-misses").innerHTML = h;
+}
 
 // ------------------------------------------------------------------ readouts
 const RO = [
@@ -185,8 +230,9 @@ function render(m) {
     $(`rv-${k}`).innerHTML = `${fmt(v[k], d)}<small>${unit}</small>`;
     spark(`rs-${k}`, h[series], k === "gpu" || k === "cpu" ? 100 : k === "vram" ? hw.gpu_mem_total : null);
   }
-  if (m.experts) drawHeat(m.experts);
+  if (m.experts) drawHeat(m.experts, latestRoute(m));
   else $("heat-count").innerHTML = `<small>appears after the first request</small>`;
+  drawTrace(m.routes || []);
   keys("k-src", [["--vram", "VRAM"], ["--pcie", "PCIe"], ["--cpu", "CPU"], ["--ink", "decode tok/s"]]);
   drawSources(reqs);
   drawVram(hw, eng);
