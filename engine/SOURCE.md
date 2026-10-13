@@ -39,7 +39,7 @@ Upstream source: `a0116b2782a5b82622358c04a06496485d12b2d6`.
 
 - #2026 (`a683000`), #2037 (`de603bb`): literal tool closer and fenced declared-tool JSON parsing, with upstream tests.
 - #2090 (`af6affb`, `4468e0e`): lend the slots the actual prompt chunk needs; halve a chunk that does not fit.
-- `aa7b0cb`: measured CPU/PCIe split, adapted to Qwen3.6. Opt-in `STRATA_PCIE_AUTO=1`; explicit `--pcie-frac` and `STRATA_PCIE_FRAC_DEFAULT=old` win. No expert skipping.
-- `9ef4484`, `25e0a2e`, `661ff29`, `d320fec`: opt-in adaptive overlap and stream-ordered pinned signal. Resident-RAM mode, async adaptation, helper/multi-GPU and device planning remain excluded. Host callbacks are disabled in this port. Allocation failure disables overlap.
+- `aa7b0cb`: measured CPU/PCIe split, adapted to Qwen3.6. Opt-in `STRATA_PCIE_AUTO=1`; an explicit `--pcie-frac` wins. No expert skipping.
+- `9ef4484`, `25e0a2e`, `661ff29`, `d320fec`: opt-in adaptive overlap and stream-ordered pinned signal. Resident-RAM mode, async adaptation, helper/multi-GPU and device planning remain excluded. The host-callback signal is left out of this port. Allocation failure disables overlap.
 
 Both performance options default off. The existing prefetch and Turing kernels are retained. Model weights, context, sampling and thinking settings are unchanged. No installer changes.

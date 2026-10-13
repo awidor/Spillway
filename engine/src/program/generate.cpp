@@ -1,4 +1,3 @@
-#include "strata/program/pcie_auto.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -61,6 +60,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/vram_cap.hpp"
+#include "strata/program/pcie_auto.hpp"
 #include "strata/core/vram_floor.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/message_boundary.hpp"
@@ -1588,9 +1588,6 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
-using strata::program::PcieAuto;
-
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2583,11 +2580,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
 #if !defined(STRATA_USE_HIP)
-            const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
-            // The upstream factor was measured on Flash-Next. Qwen3.6 keeps the old split unless locally tested.
+            // STRATA_PCIE_AUTO=1: PcieAuto refines this share.  Opt-in: its factor was measured on Flash-Next, not Qwen3.6
             const char* pfa = std::getenv("STRATA_PCIE_AUTO");
-            o.pcie_frac_auto = o.serve && o.layer_split.empty() && pfa && pfa[0] == '1' &&
-                               !(pfd != nullptr && std::strcmp(pfd, "old") == 0);
+            o.pcie_frac_auto = o.serve && o.layer_split.empty() && pfa && pfa[0] == '1';
             o.pcie_probe_gbps = bw;
 #endif
         } else {
@@ -7821,7 +7816,7 @@ int main(int argc, char** argv) {
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-        PcieAuto pcie_auto;
+        strata::program::PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && n_stages == 1) {
             const auto& pl = strata::kernels::cpu::expert_layout();
             double sum = 0.0;
@@ -7870,42 +7865,37 @@ int main(int argc, char** argv) {
                               : strata::core::dma_batch_mode() != 0 ? "not with STRATA_DMA_BATCH"
                               : adapt_lag() != 1 || adapt_nowait() ? "not with STRATA_ADAPT_LAG / STRATA_ADAPT_NOWAIT"
                               : src.complement_ready() ? "not with the resident RAM mode"
-                              : (std::getenv("STRATA_ADAPT_SIGNAL") && std::getenv("STRATA_ADAPT_SIGNAL")[0] == 'h')
-                                    ? "host callbacks disabled in this Qwen3.6 port"
                               : drive.d.usage.empty() ? "the adaptive tier is off"
                               : nullptr;
         if (aov_want) {
             if (aov_why == nullptr) {
-                agate.ticks.resize((size_t) g.n_layers + 1);
-                for (int64_t l = 0; l <= g.n_layers; ++l) agate.ticks[(size_t) l] = {&agate, (int32_t) l};
+                // the landing of each layer's copies is told by a stream-ordered D2H copy of the layer number into pinned
+                // memory: no callback thread has to be scheduled while the pool's workers spin on every other CPU
+                int32_t* vals = nullptr; void* hp = nullptr;
+                std::vector<int32_t> iota((size_t) g.n_layers);
+                for (size_t i = 0; i < iota.size(); ++i) iota[i] = (int32_t) i;
+                if (cudaMalloc((void**) &vals, iota.size() * 4) == cudaSuccess &&
+                    cudaMemcpy(vals, iota.data(), iota.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+                    cudaHostAlloc(&hp, 64, cudaHostAllocPortable) == cudaSuccess) {
+                    *(volatile int32_t*) hp = -1;
+                    agate.hland = (volatile int32_t*) hp;
+                    agate.dvals = vals;
+                } else {
+                    (void) cudaGetLastError();
+                    if (vals) cudaFree(vals);
+                    if (hp) cudaFreeHost(hp);
+                    aov_why = "cannot allocate the pinned overlap signal";
+                }
+            }
+            if (aov_why == nullptr) {
                 agate.has.assign((size_t) g.n_layers, 0);
                 if (!ver.set_adapt_gate(&agate)) aov_why = "the device-planned layers (STRATA_VERIFY_DEVICE_PLAN) are on";
-                if (aov_why == nullptr && !(std::getenv("STRATA_ADAPT_SIGNAL") && std::getenv("STRATA_ADAPT_SIGNAL")[0] == 'h')) {
-                    // the landing of each layer's copies is told by a stream-ordered D2H copy of the layer number into pinned memory
-                    // (STRATA_ADAPT_SIGNAL=host: a host function instead). No callback thread has to be scheduled while the pool's workers spin on every other CPU
-                    int32_t* vals = nullptr; void* hp = nullptr;
-                    std::vector<int32_t> iota((size_t) g.n_layers + 1);
-                    for (size_t i = 0; i < iota.size(); ++i) iota[i] = (int32_t) i;
-                    if (cudaMalloc((void**) &vals, iota.size() * 4) == cudaSuccess &&
-                        cudaMemcpy(vals, iota.data(), iota.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
-                        cudaHostAlloc(&hp, 64, cudaHostAllocPortable) == cudaSuccess) {
-                        *(volatile int32_t*) hp = -1;
-                        agate.hland = (volatile int32_t*) hp;
-                        agate.dvals = vals;
-                        std::fprintf(stderr, "strata serve: adaptive overlap signal: stream-ordered copies (STRATA_ADAPT_SIGNAL=host: a host function)\n");
-                    } else {
-                        (void) cudaGetLastError();
-                        if (vals) cudaFree(vals);
-                        if (hp) cudaFreeHost(hp);
-                        aov_why = "cannot allocate the pinned overlap signal";
-                    }
-                }
             }
             aov = aov_why == nullptr;
             if (aov)
                 std::fprintf(stderr, "strata serve: adaptive overlap (STRATA_ADAPT_OVERLAP=0 turns it off): the adaptive tier's copies land while the next window runs "
                                      "(same tokens, a layer waits for its own copies)\n");
-            else if (std::getenv("STRATA_ADAPT_OVERLAP") != nullptr)   // the env var was set: say what stopped it
+            else   // the env var was set: say what stopped it
                 std::fprintf(stderr, "strata serve: STRATA_ADAPT_OVERLAP=1 is off: %s\n", aov_why);
         } else
             std::fprintf(stderr, "strata serve: adaptive overlap: off%s%s\n",
@@ -7974,8 +7964,7 @@ int main(int argc, char** argv) {
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             if (aov) {   // 0.1.43: the copies go in layer order and each layer's landing is told to the verify window
                 std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.layer < b.layer; });
-                agate.landed.store(-1, std::memory_order_release);
-                if (agate.hland != nullptr) *agate.hland = -1;
+                *agate.hland = -1;
                 agate.has.assign((size_t) g.n_layers, 0);
                 for (const Swap& s : swaps) agate.has[(size_t) s.layer] = 1;
             }
@@ -8017,6 +8006,7 @@ int main(int argc, char** argv) {
             std::vector<void*> cp_dst;
             std::vector<const void*> cp_src;
             std::vector<size_t> cp_bytes;
+            bool asig_failed = false;   // STRATA_ADAPT_OVERLAP: a layer's landing signal could not be queued
             for (size_t si = 0; si < swaps.size(); ++si) {
                 const Swap& s = swaps[si];
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
@@ -8048,17 +8038,11 @@ int main(int argc, char** argv) {
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
-                if (aov && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
-                    (agate.hland != nullptr
-                         ? cudaMemcpyAsync((void*) agate.hland, agate.dvals + s.layer, 4, cudaMemcpyDeviceToHost, adapt_stream)
-                         : cudaLaunchHostFunc(adapt_stream, [](void* p) {
-                        auto* t = (strata::core::AdaptGate::Tick*) p;
-                        int32_t cur = t->gate->landed.load(std::memory_order_relaxed);
-                        while (cur < t->layer && !t->gate->landed.compare_exchange_weak(cur, t->layer, std::memory_order_release)) {}
-                    }, &agate.ticks[(size_t) s.layer])) != cudaSuccess) {
+                if (aov && !asig_failed && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
+                    cudaMemcpyAsync((void*) agate.hland, agate.dvals + s.layer, 4, cudaMemcpyDeviceToHost,
+                                    adapt_stream) != cudaSuccess) {
                     (void) cudaGetLastError();
-                    cudaStreamSynchronize(adapt_stream);   // no callback: wait here, the gate opens at once
-                    agate.landed.store((int32_t) g.n_layers, std::memory_order_release);
+                    asig_failed = true;   // this layer's and the later layers' copies are waited for below instead
                 }
             }
             if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),
@@ -8066,6 +8050,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: adaptive swap copy failed (batched): %s\n",
                              cudaGetErrorString(cudaGetLastError()));
                 return false;
+            }
+            if (asig_failed) {   // every copy has landed once this returns: the gate opens for all layers
+                cudaStreamSynchronize(adapt_stream);
+                *agate.hland = (int32_t) g.n_layers;
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             (void) main_live;
@@ -11394,8 +11382,7 @@ int main(int argc, char** argv) {
                                           : (pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses), -1.0);
                     if (nf >= 0.0) {
                         std::fprintf(stderr, "strata serve: PCIe share: the CPU pool takes %.0f us per missed expert (%.1f GB/s of expert bytes), "
-                                             "the link %.1f GB/s -> pcie_frac %.2f (was %.2f; --pcie-frac N fixes it, "
-                                             "STRATA_PCIE_FRAC_DEFAULT=old keeps the start-up rule)\n",
+                                             "the link %.1f GB/s -> pcie_frac %.2f (was %.2f; --pcie-frac N fixes it)\n",
                                      tc_us, rate, pcie_auto.link_gbps, nf, o.pcie_frac);
                         o.pcie_frac = nf;
                         req_pcie_frac = nf;

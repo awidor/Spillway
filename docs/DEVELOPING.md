@@ -76,7 +76,7 @@ The installer measures the settings marked "tuned" on the laptop.
 | `STRATA_ATTN_TC=0` | on | decode windows on tensor cores |
 | `STRATA_PROMPT_MQ=2` | 1 | prompt attention in hi + lo halves, bit for bit the old output |
 | `STRATA_ROUTER_OLD=1`, `STRATA_ROUTE_PER_TOKEN=1`, `STRATA_IQ_MMVQ_LDS=0` | | the older kernels, for A/B |
-| `STRATA_PCIE_AUTO=1` | off | refine the CPU/PCIe split from measured CPU expert work; explicit `--pcie-frac` and `STRATA_PCIE_FRAC_DEFAULT=old` take precedence |
+| `STRATA_PCIE_AUTO=1` | off | refine the CPU/PCIe split from measured CPU expert work; an explicit `--pcie-frac` takes precedence |
 | `STRATA_ADAPT_OVERLAP=1` | off | overlap adaptive-cache copies with decode, using stream-ordered pinned signals; one GPU, plain RAM mode, no async/device planning |
 | `STRATA_DECODE_TIMING=1`, `STRATA_VERIFY_PROFILE=1`, `STRATA_PREGATE_STATS=1` | | per-request timing, GPU stage profile, prefetch score |
 

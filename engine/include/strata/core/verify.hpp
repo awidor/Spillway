@@ -42,21 +42,13 @@ namespace strata::core {
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
 /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
 /// bytes arrive layer by layer: `run` holds a layer's plan (the first thing that lets the GPU read the layer's expert
-/// slots) back until `landed >= layer` for a layer with a swap (`has[layer]`).  Set `active` only around one window.
+/// slots) back until `*hland >= layer` for a layer with a swap (`has[layer]`).  Set `active` only around one window.
 struct AdaptGate {
-    struct Tick { AdaptGate* gate; int32_t layer; };
-    std::atomic<int32_t> landed{-1};      ///< the highest layer whose swap copies have landed (n_layers: all of them)
     std::atomic<bool> active{false};
     std::vector<uint8_t> has;             ///< per layer: a swap copies into this layer's slots
-    std::vector<Tick> ticks;              ///< host-function contexts, one per layer and the final one (stable storage)
-    const int32_t* dvals = nullptr;       ///< device [0..n_layers]: the source of those copies
-    volatile int32_t* hland = nullptr;   ///< pinned host int the copy stream writes (a D2H copy of the layer number), instead of a host function; null: host functions
-    int32_t reached() const {
-        const int32_t a = landed.load(std::memory_order_acquire);
-        if (hland == nullptr) return a;
-        const int32_t b = *hland;
-        return a > b ? a : b;
-    }
+    const int32_t* dvals = nullptr;       ///< device [0..n_layers): each layer's number, the source of the signal copies
+    volatile int32_t* hland = nullptr;    ///< pinned host int: the highest layer whose swap copies have landed (n_layers:
+                                          ///< all), written by a D2H copy on the copy stream after that layer's copies
 };
 
 class NativeHead;

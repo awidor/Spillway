@@ -2170,11 +2170,11 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
 }
 
 // 0.1.43 (STRATA_ADAPT_OVERLAP): hold the host until the adaptive tier's copies up to `layer` have landed.  The wait
-// is a spin on an atomic the copy stream's host functions raise (no driver call here); 20 s is the window's own limit.
+// is a spin on the pinned int the copy stream's D2H copies write (no driver call here); 20 s is the window's own limit.
 bool Verifier::adapt_gate_wait(int32_t layer, std::string& err) {
     const Clock::time_point t0 = Clock::now();
     uint32_t spins = 0;
-    while (adapt_gate_->reached() < layer) {
+    while (*adapt_gate_->hland < layer) {
         _mm_pause();
         if ((++spins & 1023u) != 0) continue;
         if (Clock::now() - t0 > std::chrono::seconds(20)) {
@@ -2220,9 +2220,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
-    // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
-    if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
-        !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
