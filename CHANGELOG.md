@@ -2,12 +2,16 @@
 
 All measurements: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-## Unreleased
+## v0.5.3
 
-- Backport literal tool-closer handling and fenced declared-tool JSON recovery from Strata #2026/#2037.
-- Backport #2090's prompt-cache loan fix, including bounded chunk reduction instead of an engine exit.
-- Add independent opt-in measured CPU/PCIe split and adaptive-cache overlap, retaining the existing Qwen3.6 prefetch. Both default off; no experts are skipped.
-- Register a CPU controller regression test that remains active in Release builds.
+- A message that quotes `</tool_call>` as text no longer ends the reply empty: the model was handed the real
+  end-of-call token and copied it.
+- A tool call written as JSON inside a ```` ```json ```` fence in the call wrapper is read as the call.
+- Some prompts needed more borrowed VRAM cache than start-up set aside, and the engine stopped. It now borrows more, and
+  reads a chunk that still does not fit in halves.
+- Two opt-in speed settings, both off by default: `STRATA_PCIE_AUTO=1` sets the CPU/PCIe split from the CPU's measured
+  speed (not with an explicit `--pcie-frac`), and `STRATA_ADAPT_OVERLAP=1` copies the experts it moves into VRAM while
+  decoding goes on. Backported from Strata v0.1.43.1 by vwidor.
 
 ## v0.5.2
 
