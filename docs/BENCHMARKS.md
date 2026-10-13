@@ -252,3 +252,20 @@ MTP k=3), 128 tokens, `dev/release_ab.sh`:
 
 The installer now also tries `--pcie-frac 0.66` and `1`, the prefetch off and at 2 or 5 a layer, and 8 copy blocks, so the laptop
 picks its own CPU/PCIe split: the i3 here is far weaker than the laptop's i7.
+
+## Selected Strata v0.1.43.1 backports, RTX 2070 Max-Q
+
+RTX 2070 Max-Q 8 GB, i7-9750H, 16 GB RAM, CUDA 12.4, GCC 13, sm_75. Qwen3.6-35B-A3B, the same 3.06 bpw GGUF and pack; 131072 context, int8 KV, kv-grow, MTP k=3, reserve 450 MiB, four CPU workers.
+
+Two alternating runs per mode and prompt length, a synthetic Python coding task, 1024 output tokens per run. Baseline and overlap used `--pcie-frac 0.35`; only the measured controller could refine that split.
+
+| Median decode tok/s | 6K input | 30K input |
+|---|---:|---:|
+| v0.5.2 baseline | 91.85 | 83.55 |
+| Backports, both options off | 92.95 | 83.65 |
+| Adaptive overlap only | 96.65 | 85.25 |
+| Measured CPU/PCIe split only | 98.35 (+7.08%) | 84.80 (+1.50%) |
+
+The measured split's two runs beat both baseline runs at each prompt length. Overlap had more spread (6K: 100.4 and 92.9 tok/s); a separate timing diagnostic exercised 110 overlapped windows. The options remain off by default. No combined-options benchmark was run.
+
+The unchanged baseline's repeated full-output hashes differed at both lengths, so byte-identical full replies are not claimed. This small synthetic comparison is not a broad quality or sustained-load result. Four GPU parity programs passed: `qsa_prompt_attn_parity`, `native_grouped_parity`, `route_window_parity`, `cuda_router_fast`. The parser, structured-output, server and reasoning-tool suites passed 308 tests. A synthetic 100186-token retrieval with beginning/middle/end markers returned correct JSON in 133.809 s; a client disconnect released the single slot in 0.253 s.
