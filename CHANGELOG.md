@@ -2,6 +2,13 @@
 
 All measurements: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
+## Unreleased
+
+- Backport literal tool-closer handling and fenced declared-tool JSON recovery from Strata #2026/#2037.
+- Backport #2090's prompt-cache loan fix, including bounded chunk reduction instead of an engine exit.
+- Add independent opt-in measured CPU/PCIe split and adaptive-cache overlap, retaining the existing Qwen3.6 prefetch. Both default off; no experts are skipped.
+- Register a CPU controller regression test that remains active in Release builds.
+
 ## v0.5.2
 
 - The service listens on the network by default, without an API key. `--lan` still works and is now the default,

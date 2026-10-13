@@ -76,6 +76,8 @@ The installer measures the settings marked "tuned" on the laptop.
 | `STRATA_ATTN_TC=0` | on | decode windows on tensor cores |
 | `STRATA_PROMPT_MQ=2` | 1 | prompt attention in hi + lo halves, bit for bit the old output |
 | `STRATA_ROUTER_OLD=1`, `STRATA_ROUTE_PER_TOKEN=1`, `STRATA_IQ_MMVQ_LDS=0` | | the older kernels, for A/B |
+| `STRATA_PCIE_AUTO=1` | off | refine the CPU/PCIe split from measured CPU expert work; explicit `--pcie-frac` and `STRATA_PCIE_FRAC_DEFAULT=old` take precedence |
+| `STRATA_ADAPT_OVERLAP=1` | off | overlap adaptive-cache copies with decode, using stream-ordered pinned signals; one GPU, plain RAM mode, no async/device planning |
 | `STRATA_DECODE_TIMING=1`, `STRATA_VERIFY_PROFILE=1`, `STRATA_PREGATE_STATS=1` | | per-request timing, GPU stage profile, prefetch score |
 
 ## Releases
@@ -83,3 +85,14 @@ The installer measures the settings marked "tuned" on the laptop.
 Tag `vX.Y.Z` and push the tag. `.github/workflows/release.yml` builds and packages, then attaches the tarball, its
 checksum and `install.sh` to a draft release. Write the notes using the structure of the earlier releases, check the
 draft, then publish it.
+
+### CPU/PCIe controller regression test
+
+`pcie_auto_test` is a CPU-only CTest target. Its checks remain active in Release builds (`NDEBUG`): disabled state, prompt-work exclusion, bounded 0.05-step changes, three-update limit, no-miss and zero-time cases.
+
+```bash
+cmake --build build --target pcie_auto_test
+ctest --test-dir build -R '^pcie_auto_test$' --output-on-failure
+```
+
+The performance options are independent. Measure each against the same fixed baseline before keeping it; no combined-options gain is claimed. The overlap port deliberately excludes host callbacks and resident-RAM mode. Do not infer a thinking budget or a weight-precision change from these settings.
