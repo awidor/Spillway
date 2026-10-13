@@ -277,18 +277,20 @@ class NoLeakedSampler(unittest.TestCase):
 
     def test_server_close_ends_the_sampler(self):
         import threading
-        import time
+
+        def samplers():
+            return {t for t in threading.enumerate() if t.name.endswith("(_loop)")}
+        # this server's own sampler, not a count: an earlier test's may still be finishing its last sample (CI flake)
         tok = ByteTokenizer()
-        before = sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)"))
+        before = samplers()
         httpd = serve(Service(MockEngine(tok, ANSWER, max_context=16384), tok, TEMPLATE), port=0)
-        self.assertEqual(sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)")), before + 1)
+        new = samplers() - before
+        self.assertEqual(len(new), 1)
         httpd.shutdown()
         httpd.server_close()
-        for _ in range(50):
-            if sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)")) == before:
-                break
-            time.sleep(0.1)
-        self.assertEqual(sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)")), before)
+        (sampler,) = new
+        sampler.join(5)
+        self.assertFalse(sampler.is_alive())
 
 
 # ------------------------------------------------------------------------------------------------ over HTTP
